@@ -1,0 +1,14 @@
+{
+  "name": "atm-formulario08-extractor-manuscrito",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Extractor asistido para Formulario 08 manuscrito con salida JSON compatible.",
+  "scripts": {
+    "extractor": "node src/extract-manuscrito.js",
+    "extract-manuscrito": "node src/extract-manuscrito.js"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "pdf-parse": "^1.1.1"
+  }
+}

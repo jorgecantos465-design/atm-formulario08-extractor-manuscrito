@@ -1,0 +1,16 @@
+node_modules/
+input/
+logs/
+output/
+debug/
+.env*
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.sqlite
+*.db
+exports/
+temp/
+cache/

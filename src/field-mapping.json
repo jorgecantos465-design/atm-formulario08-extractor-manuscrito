@@ -1,0 +1,142 @@
+{
+  "version": "0.1.0",
+  "purpose": "Equivalencia entre campos detectados en Formulario 08 manuscrito y placeholders del template final existente.",
+  "confidenceLevels": ["alta", "media", "baja"],
+  "templateFields": {
+    "@usuario@": {
+      "normalizedName": "cuit_cuil_comprador_adquirente",
+      "sourceField": "cuitCuilCompradorAdquirente",
+      "description": "CUIT/CUIL del comprador o adquirente. Tambien se replica en @atributo8@."
+    },
+    "@apellido@": {
+      "normalizedName": "apellido",
+      "sourceField": "apellidoCompradorAdquirente",
+      "description": "Apellido si puede separarse del nombre completo. En manuscritos suele quedar null."
+    },
+    "@nombre@": {
+      "normalizedName": "nombre",
+      "sourceField": "nombreCompradorAdquirente",
+      "description": "Nombre si puede separarse del nombre completo. En manuscritos suele quedar null."
+    },
+    "@email@": {
+      "normalizedName": "correo_electronico",
+      "sourceField": "correoElectronico",
+      "description": "Correo electronico legible si aparece."
+    },
+    "@atributo8@": {
+      "normalizedName": "cuit_cuil_comprador_adquirente",
+      "sourceField": "cuitCuilCompradorAdquirente",
+      "description": "CUIT/CUIL del comprador o adquirente."
+    },
+    "@atributo9@": {
+      "normalizedName": "nombre_comprador_adquirente",
+      "sourceField": "nombreCompletoCompradorAdquirente",
+      "description": "Nombre completo o razon social del comprador/adquirente."
+    },
+    "@atributo7@": {
+      "normalizedName": "expediente",
+      "sourceField": "expediente",
+      "description": "Expediente si aparece en caratula, nota o sello."
+    },
+    "@atributo10@": {
+      "normalizedName": "iniciador_nombre",
+      "sourceField": "iniciadorNombre",
+      "description": "Nombre del iniciador, gestor o presentante si aparece."
+    },
+    "@atributo11@": {
+      "normalizedName": "iniciador_cuit_cuil",
+      "sourceField": "iniciadorCuitCuil",
+      "description": "CUIT/CUIL del iniciador si aparece."
+    },
+    "@atributo12@": {
+      "normalizedName": "iniciador_caracter",
+      "sourceField": "iniciadorCaracter",
+      "description": "Caracter del iniciador si aparece."
+    },
+    "@atributo13@": {
+      "normalizedName": "registro",
+      "sourceField": "registro",
+      "description": "Registro seccional si aparece."
+    },
+    "@atributo14@": {
+      "normalizedName": "numero_formulario",
+      "sourceField": "numeroFormulario",
+      "description": "Numero del Formulario 08."
+    },
+    "@atributo15@": {
+      "normalizedName": "dominio",
+      "sourceField": "dominio",
+      "description": "Dominio/patente del vehiculo."
+    },
+    "@atributo16@": {
+      "normalizedName": "domicilio",
+      "sourceField": "domicilio",
+      "description": "Domicilio del comprador/adquirente."
+    },
+    "@atributo17@": {
+      "normalizedName": "fecha",
+      "sourceField": "fecha",
+      "description": "Fecha legible asociada al formulario o tramite."
+    },
+    "@atributo18@": {
+      "normalizedName": "marca_modelo",
+      "sourceField": "marcaModelo",
+      "description": "Marca/modelo del vehiculo si aparece y es legible."
+    },
+    "@atributo19@": {
+      "normalizedName": "anio",
+      "sourceField": "anio",
+      "description": "Ano/modelo del vehiculo si aparece."
+    },
+    "@atributo20@": {
+      "normalizedName": "anio",
+      "sourceField": "anio",
+      "description": "Ano/modelo replicado por compatibilidad con template actual."
+    },
+    "@atributo21@": {
+      "normalizedName": "cuit_cuil_vendedor",
+      "sourceField": "cuitCuilVendedor",
+      "description": "CUIT/CUIL del vendedor si aparece."
+    },
+    "@atributo22@": {
+      "normalizedName": "nombre_vendedor",
+      "sourceField": "nombreVendedor",
+      "description": "Nombre completo o razon social del vendedor si aparece."
+    },
+    "@atributo30@": {
+      "normalizedName": "fecha_inicio_tramite",
+      "sourceField": "fechaInicioTramite",
+      "description": "Fecha de inicio de tramite si aparece."
+    },
+    "@atributo33@": {
+      "normalizedName": "monto_operacion",
+      "sourceField": "montoOperacion",
+      "description": "Monto de operacion si aparece."
+    },
+    "localidad": {
+      "normalizedName": "localidad",
+      "sourceField": "localidad",
+      "description": "Localidad del comprador/adquirente. Campo auxiliar para revision humana."
+    },
+    "provincia": {
+      "normalizedName": "provincia",
+      "sourceField": "provincia",
+      "description": "Provincia del comprador/adquirente. Campo auxiliar para revision humana."
+    },
+    "codigo_postal": {
+      "normalizedName": "codigo_postal",
+      "sourceField": "codigoPostal",
+      "description": "Codigo postal del comprador/adquirente. Campo auxiliar para revision humana."
+    },
+    "telefono": {
+      "normalizedName": "telefono",
+      "sourceField": "telefono",
+      "description": "Telefono legible si aparece. Campo auxiliar para revision humana."
+    },
+    "observaciones_relevantes": {
+      "normalizedName": "observaciones_relevantes",
+      "sourceField": "observacionesRelevantes",
+      "description": "Notas, sellos o aclaraciones legibles relevantes para revision humana."
+    }
+  }
+}

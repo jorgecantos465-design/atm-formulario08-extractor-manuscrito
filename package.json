@@ -5,10 +5,17 @@
   "description": "Extractor asistido para Formulario 08 manuscrito con salida JSON compatible.",
   "scripts": {
     "extractor": "node src/extract-manuscrito.js",
-    "extract-manuscrito": "node src/extract-manuscrito.js"
+    "extract-manuscrito": "node src/extract-manuscrito.js",
+    "extractor:easyocr": "node src/extract-manuscrito.js --easyocr",
+    "extractor:xlsx": "node src/extract-manuscrito.js --experimental-xlsx"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.0",
+    "dotenv": "^17.4.2",
+    "exceljs": "^4.4.0",
     "jszip": "^3.10.1",
-    "pdf-parse": "^1.1.1"
+    "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^5.7.284",
+    "saxes": "^5.0.1"
   }
 }

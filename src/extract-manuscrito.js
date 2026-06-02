@@ -2,7 +2,12 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
+const ExcelJS = require("exceljs");
 const JSZip = require("jszip");
+const { SaxesParser } = require("saxes");
+const dotenv = require("dotenv");
+const { createCanvas, DOMMatrix, DOMPoint, DOMRect, ImageData, Path2D } = require("@napi-rs/canvas");
+dotenv.config({ quiet: true });
 
 let pdfParse = null;
 try {
@@ -11,82 +16,89 @@ try {
   pdfParse = null;
 }
 
+let pdfJsModulePromise = null;
+
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const INPUT_DIR = path.join(PROJECT_ROOT, "input");
 const OUTPUT_DIR = path.join(PROJECT_ROOT, "output");
 const DEBUG_DIR = path.join(PROJECT_ROOT, "debug");
 const TEMPLATE_DIR = path.join(PROJECT_ROOT, "templates");
 const LOG_DIR = path.join(PROJECT_ROOT, "logs");
-const MAPPING_PATH = path.join(__dirname, "field-mapping.json");
-
-loadDotEnv(path.join(PROJECT_ROOT, ".env"));
+const EASYOCR_PROBE_PATH = path.join(__dirname, "easyocr_probe.py");
+const ENV_EXAMPLE_PATH = path.join(PROJECT_ROOT, ".env.example");
+const ENV_PATH = path.join(PROJECT_ROOT, ".env");
+const TEMPLATE_ODS_PATH = path.join(TEMPLATE_DIR, "Modelo Resolucion General.ods");
+const TEMPLATE_XLSX_PATH = path.join(TEMPLATE_DIR, "Modelo Resolucion General.xlsx");
+const READBACK_XLSX_DEBUG_PATH = path.join(DEBUG_DIR, "readback_xlsx.json");
+const READBACK_ODS_DEBUG_PATH = path.join(DEBUG_DIR, "readback_ods.json");
+const ALLOWED_FIELDS_MAPPING_DEBUG_PATH = path.join(DEBUG_DIR, "allowed_fields_mapping.json");
 
 const SUPPORTED_EXTENSIONS = new Set([".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"]);
 const CONFIDENCE = ["alta", "media", "baja", "baja_confianza"];
-const PLACEHOLDER_ROW = 2;
-const FIRST_DATA_ROW = 3;
-const INICIADOR_PLACEHOLDER = "@atributo10@";
-const DATE_PLACEHOLDERS = new Set(["@atributo17@", "@atributo30@"]);
-const NEVER_FILL = new Set([
-  "@atributo23@",
-  "@atributo24@",
-  "@atributo25@",
-  "@atributo26@",
-  "@atributo27@",
-  "@atributo32@",
-  "@atributo34@",
-]);
 const OCR_MIN_CHARS = 50;
 const OCR_MIN_WORDS = 8;
 const OCR_HARD_FAIL_CHARS = 50;
+const VISION_MIN_IMAGE_BYTES = 1024;
 const OCR_MODE = String(process.env.MANUSCRITO_OCR_MODE || "openai_vision").toLowerCase();
 const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini";
+const EASY_OCR_ENABLED = process.argv.includes("--easyocr") || String(process.env.MANUSCRITO_EASYOCR || "").trim() === "1";
+const EXPERIMENTAL_XLSX_ENABLED = process.argv.includes("--experimental-xlsx");
 const OCR_FAILURE_MESSAGE = "NO SE DETECTARON DATOS SUFICIENTES DEL FORMULARIO";
 const OCR_ENGINE_FAILURE_MESSAGE = "Falla de OCR: el motor actual no puede leer este manuscrito con precision suficiente.";
-const VISION_API_KEY_MESSAGE = "Falta configurar OPENAI_API_KEY para usar extraccion manuscrita con Vision AI";
-
-function loadDotEnv(envPath) {
-  if (!fs.existsSync(envPath)) return;
-  const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!match) continue;
-    const [, key, rawValue] = match;
-    if (process.env[key] != null && process.env[key] !== "") continue;
-    process.env[key] = rawValue.replace(/^(['"])(.*)\1$/, "$2");
-  }
-}
+const VISION_API_KEY_MESSAGE = "Falta configurar OPENAI_API_KEY en el archivo .env";
+const BASIC_VISION_PROMPT = "Describi todo lo que ves en esta imagen.";
+const STRUCTURED_VISION_PROMPT = [
+  "Lee la imagen completa de un Formulario 08 manuscrito argentino.",
+  "No inventes datos. Si un dato no aparece, devuelve valor null.",
+  "No extraigas campos manuales, formulas ni campos marcados como NO PONER.",
+  "Responde solo JSON valido, sin Markdown.",
+  "El JSON debe tener detectedFields, candidates, rawLines, rawText y observations.",
+  "Dentro de detectedFields devuelve exactamente estos campos automaticos permitidos: cuit_adquirente, nombre_adquirente, email, cuit_adquirente_f08, nombre_adquirente_f08, numero_formulario_08, dominio, domicilio_adquirente, lugar_fecha_impresion_osd, marca, modelo, modelo_anio, anio_fabricacion, cuit_vendedor, nombre_vendedor, letra_multa, fecha_liquidacion, fecha_inicio_tramite, periodo, monto_operacion.",
+  "Cada detectedFields.<campo> debe tener valor, confianza y observacion.",
+  "confianza debe ser alta, media, baja o baja_confianza.",
+].join("\n");
+const AUTOMATIC_FIELD_ORDER = [
+  "cuit_adquirente",
+  "nombre_adquirente",
+  "email",
+  "cuit_adquirente_f08",
+  "nombre_adquirente_f08",
+  "numero_formulario_08",
+  "dominio",
+  "domicilio_adquirente",
+  "lugar_fecha_impresion_osd",
+  "marca",
+  "modelo",
+  "modelo_anio",
+  "anio_fabricacion",
+  "cuit_vendedor",
+  "nombre_vendedor",
+  "letra_multa",
+  "fecha_liquidacion",
+  "fecha_inicio_tramite",
+  "periodo",
+  "monto_operacion",
+];
 
 function getOpenAiApiKey() {
   return String(process.env.OPENAI_API_KEY || "").trim();
 }
 
-const TEMPLATE_PLACEHOLDERS = [
-  "@usuario@",
-  "@apellido@",
-  "@nombre@",
-  "@email@",
-  "@atributo8@",
-  "@atributo9@",
-  "@atributo7@",
-  "@atributo10@",
-  "@atributo11@",
-  "@atributo12@",
-  "@atributo13@",
-  "@atributo14@",
-  "@atributo15@",
-  "@atributo16@",
-  "@atributo17@",
-  "@atributo18@",
-  "@atributo19@",
-  "@atributo20@",
-  "@atributo21@",
-  "@atributo22@",
-  "@atributo30@",
-  "@atributo33@",
-];
+function hasConfiguredOpenAiApiKey() {
+  const apiKey = getOpenAiApiKey();
+  return Boolean(apiKey && apiKey !== "pegar_api_key_aqui" && apiKey !== "tu_api_key");
+}
+
+function ensureOpenAiEnvFiles() {
+  const exampleContent = "OPENAI_API_KEY=pegar_api_key_aqui\n";
+  if (!fs.existsSync(ENV_EXAMPLE_PATH)) {
+    fs.writeFileSync(ENV_EXAMPLE_PATH, exampleContent, "utf8");
+  }
+  if (!fs.existsSync(ENV_PATH)) {
+    fs.writeFileSync(ENV_PATH, exampleContent, "utf8");
+  }
+  dotenv.config({ path: ENV_PATH, quiet: true });
+}
 
 function ensureDirs() {
   for (const dir of [INPUT_DIR, OUTPUT_DIR, DEBUG_DIR, TEMPLATE_DIR, LOG_DIR]) {
@@ -113,7 +125,7 @@ function moveExistingAuxiliaryOutputFiles() {
   fs.mkdirSync(archiveDir, { recursive: true });
   for (const entry of fs.readdirSync(OUTPUT_DIR, { withFileTypes: true })) {
     if (!entry.isFile()) continue;
-    if (/\.ods$/i.test(entry.name)) continue;
+    if (/\.(ods|xlsx)$/i.test(entry.name)) continue;
     const source = path.join(OUTPUT_DIR, entry.name);
     const target = uniquePath(path.join(archiveDir, entry.name));
     fs.renameSync(source, target);
@@ -143,43 +155,21 @@ function stripAccents(text) {
   return String(text || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
 
-function escapeXml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function unescapeXml(value) {
-  return String(value || "")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
-}
-
-function columnName(columnNumber) {
-  let value = columnNumber;
-  let name = "";
-  while (value > 0) {
-    const mod = (value - 1) % 26;
-    name = String.fromCharCode(65 + mod) + name;
-    value = Math.floor((value - mod) / 26);
-  }
-  return name;
-}
-
 function safeValue(value) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
-  if (!text || text.length < 2) return null;
+  if (isNullLikeValue(text) || text.length < 2) return null;
   return text;
+}
+
+function isNullLikeValue(value) {
+  if (value == null) return true;
+  const text = stripAccents(String(value)).trim().toUpperCase();
+  return text === "" || text === "NULL" || text === "N/A" || text === "NA" || text === "NO LEGIBLE" || text === "ILEGIBLE" || text === "NO ENCONTRADO";
 }
 
 function field(value, confidence, evidence = "", notes = "") {
   const normalizedConfidence = CONFIDENCE.includes(confidence) ? confidence : "baja_confianza";
-  if (value == null || value === "") {
+  if (isNullLikeValue(value)) {
     return { value: null, confidence: "baja_confianza", evidence: evidence || null, notes: notes || "No legible o no encontrado." };
   }
   return { value, confidence: normalizedConfidence, evidence: evidence || null, notes: notes || null };
@@ -195,6 +185,7 @@ function emptyDetectedFields() {
     apellidoCompradorAdquirente: field(null, "baja"),
     nombreCompradorAdquirente: field(null, "baja"),
     domicilio: field(null, "baja"),
+    domicilioLegal: field(null, "baja"),
     localidad: field(null, "baja"),
     provincia: field(null, "baja"),
     codigoPostal: field(null, "baja"),
@@ -249,6 +240,177 @@ function responseText(responseJson) {
   return chunks.join("\n");
 }
 
+function parseJsonLoose(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) {
+      try {
+        return JSON.parse(fenced[1].trim());
+      } catch (_) {
+        return null;
+      }
+    }
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(text.slice(start, end + 1));
+      } catch (_) {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function makeImageInput(imagePath) {
+  return {
+    type: "input_image",
+    detail: "high",
+    image_url: `data:${mimeTypeFor(imagePath)};base64,${fs.readFileSync(imagePath).toString("base64")}`,
+  };
+}
+
+function imageSizeBytes(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function validateVisionImage(imagePath, log) {
+  const bytes = imageSizeBytes(imagePath);
+  if (bytes >= VISION_MIN_IMAGE_BYTES) return null;
+  const message = "Conversión PDF → imagen fallida";
+  log.push({ phase: "vision_image", status: "conversion_pdf_imagen_fallida", value: message, bytes });
+  return message;
+}
+
+async function loadPdfJs() {
+  if (!globalThis.DOMMatrix) globalThis.DOMMatrix = DOMMatrix;
+  if (!globalThis.DOMPoint) globalThis.DOMPoint = DOMPoint;
+  if (!globalThis.DOMRect) globalThis.DOMRect = DOMRect;
+  if (!globalThis.ImageData) globalThis.ImageData = ImageData;
+  if (!globalThis.Path2D) globalThis.Path2D = Path2D;
+
+  if (!pdfJsModulePromise) {
+    pdfJsModulePromise = import("pdfjs-dist/legacy/build/pdf.mjs");
+  }
+  return pdfJsModulePromise;
+}
+
+async function renderPdfFirstPageWithPdfJs(pdfPath, outPath, log) {
+  try {
+    const pdfjsLib = await loadPdfJs();
+    const loadingTask = pdfjsLib.getDocument({
+      data: new Uint8Array(fs.readFileSync(pdfPath)),
+      disableWorker: true,
+      useSystemFonts: true,
+    });
+    const pdf = await loadingTask.promise;
+    const page = await pdf.getPage(1);
+    const viewport = page.getViewport({ scale: 3 });
+    const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+    const canvasContext = canvas.getContext("2d");
+    await page.render({ canvasContext, viewport }).promise;
+    fs.writeFileSync(outPath, canvas.toBuffer("image/png"));
+    const bytes = imageSizeBytes(outPath);
+    log.push({ phase: "pdf_render", status: bytes >= VISION_MIN_IMAGE_BYTES ? "capturado_pdfjs" : "pdfjs_imagen_invalida", value: outPath, bytes });
+    return bytes >= VISION_MIN_IMAGE_BYTES ? outPath : null;
+  } catch (error) {
+    log.push({ phase: "pdf_render", status: "error_pdfjs", value: error.message });
+    return null;
+  }
+}
+
+async function renderFirstPageForVision(filePath, log) {
+  const ext = path.extname(filePath).toLowerCase();
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "f08-vision-"));
+  const outPath = path.join(workDir, "input_page_1.png");
+
+  if (ext !== ".pdf") {
+    if (!/^image\//.test(mimeTypeFor(filePath))) {
+      log.push({ phase: "vision_image", status: "formato_no_soportado", value: filePath });
+      return { imagePath: null, workDir, error: "OpenAI Vision requiere imagen o PDF renderizable." };
+    }
+    if (ext === ".png") {
+      fs.copyFileSync(filePath, outPath);
+      log.push({ phase: "vision_image", status: "imagen_png_copiada", value: outPath });
+      const imageError = validateVisionImage(outPath, log);
+      if (imageError) return { imagePath: null, workDir, error: imageError };
+      return { imagePath: outPath, workDir, error: null };
+    }
+    if (commandExists("magick")) {
+      try {
+        execFileSync("magick", [filePath, outPath], { stdio: "ignore" });
+        log.push({ phase: "vision_image", status: "imagen_convertida_png", value: outPath });
+        const imageError = validateVisionImage(outPath, log);
+        if (imageError) return { imagePath: null, workDir, error: imageError };
+        return { imagePath: outPath, workDir, error: null };
+      } catch (error) {
+        log.push({ phase: "vision_image", status: "error_conversion_imagen", value: error.message });
+        return { imagePath: null, workDir, error: error.message };
+      }
+    }
+    fs.copyFileSync(filePath, outPath);
+    log.push({ phase: "vision_image", status: "imagen_copiada_sin_conversion", value: outPath });
+    const imageError = validateVisionImage(outPath, log);
+    if (imageError) return { imagePath: null, workDir, error: imageError };
+    return { imagePath: outPath, workDir, error: null };
+  }
+
+  const pdfJsImage = await renderPdfFirstPageWithPdfJs(filePath, outPath, log);
+  if (pdfJsImage) {
+    log.push({ phase: "vision_image", status: "pdf_pagina_1_renderizada_pdfjs", value: outPath, bytes: imageSizeBytes(outPath) });
+    return { imagePath: outPath, workDir, error: null };
+  }
+
+  const pages = renderPdfForOcr(filePath, workDir, log);
+  if (!pages.length) {
+    return { imagePath: null, workDir, error: "Conversión PDF → imagen fallida" };
+  }
+  fs.copyFileSync(pages[0], outPath);
+  log.push({ phase: "vision_image", status: "pdf_pagina_1_renderizada", value: outPath });
+  const imageError = validateVisionImage(outPath, log);
+  if (imageError) return { imagePath: null, workDir, error: imageError };
+  return { imagePath: outPath, workDir, error: null };
+}
+
+async function callOpenAiVision(imagePath, prompt, log, phase) {
+  const apiKey = getOpenAiApiKey();
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENAI_VISION_MODEL,
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: prompt },
+            makeImageInput(imagePath),
+          ],
+        },
+      ],
+    }),
+  });
+  const responseJson = await response.json();
+  const rawText = responseText(responseJson);
+  log.push({ phase, status: response.ok ? "ok" : "error", chars: rawText.length, httpStatus: response.status });
+  if (!response.ok) {
+    throw new Error(responseJson.error?.message || `OpenAI API HTTP ${response.status}`);
+  }
+  return { responseJson, rawText };
+}
+
 function structuredVisionToText(data) {
   const fields = data?.detectedFields || data?.fields || {};
   const lines = [];
@@ -264,7 +426,6 @@ function structuredVisionToText(data) {
 
 async function runOpenAiVision(filePath, log) {
   const apiKey = getOpenAiApiKey();
-  const model = OPENAI_VISION_MODEL;
   if (!apiKey) {
     log.push({
       phase: "vision_ai",
@@ -285,79 +446,30 @@ async function runOpenAiVision(filePath, log) {
     };
   }
 
-  const ext = path.extname(filePath).toLowerCase();
-  let workDir = null;
-  let visionInputs = [];
-  if (ext === ".pdf") {
-    visionInputs = [
-      {
-        type: "input_file",
-        filename: path.basename(filePath),
-        file_data: `data:application/pdf;base64,${fs.readFileSync(filePath).toString("base64")}`,
-      },
-    ];
-  } else if (!/^image\//.test(mimeTypeFor(filePath))) {
-    log.push({ phase: "vision_ai", status: "formato_no_soportado", value: "OpenAI Vision requiere imagen o PDF renderizable." });
+  const rendered = await renderFirstPageForVision(filePath, log);
+  if (!rendered.imagePath) {
+    log.push({ phase: "vision_ai", status: "sin_imagen_para_vision", value: rendered.error });
     return {
       text: "",
       method: "openai_vision",
       diagnostic: {
         bestVariant: "openai_vision",
-        bestImagePath: filePath,
+        bestImagePath: null,
+        workDir: rendered.workDir,
+        imageError: rendered.error,
         stats: textStats(""),
-        variants: [{ variant: "openai_vision", chars: 0, words: 0, useful: false, blocks: 0, error: "Formato no soportado por Vision AI" }],
+        variants: [{ variant: "openai_vision", chars: 0, words: 0, useful: false, blocks: 0, error: rendered.error }],
       },
       blocks: [],
     };
-  } else {
-    visionInputs = [
-      {
-        type: "input_image",
-        detail: "high",
-        image_url: `data:${mimeTypeFor(filePath)};base64,${fs.readFileSync(filePath).toString("base64")}`,
-      },
-    ];
   }
 
-  const prompt = [
-    "Lee la imagen completa de un Formulario 08 manuscrito argentino.",
-    "No inventes datos. Devuelve candidatos aunque sean parciales o dudosos.",
-    "Responde solo JSON con detectedFields, candidates, rawLines y rawText.",
-    "Campos esperados: dominio, numeroFormulario, fecha, cuitCuilCompradorAdquirente, nombreCompletoCompradorAdquirente, domicilio, localidad, provincia, correoElectronico, telefono, iniciadorNombre, iniciadorCuitCuil, registro, marcaModelo, anio, cuitCuilVendedor, nombreVendedor, montoOperacion.",
-    "Cada detectedFields.<campo> debe tener value, confidence y evidence.",
-  ].join("\n");
-
   try {
-    const response = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        input: [
-          {
-            role: "user",
-            content: [
-              { type: "input_text", text: prompt },
-              ...visionInputs,
-            ],
-          },
-        ],
-      }),
-    });
-    const responseJson = await response.json();
-    if (!response.ok) {
-      throw new Error(responseJson.error?.message || `OpenAI API HTTP ${response.status}`);
-    }
-    const raw = responseText(responseJson);
-    let structured = null;
-    try {
-      structured = JSON.parse(raw);
-    } catch (_) {
-      structured = { rawText: raw };
-    }
+    const basic = await callOpenAiVision(rendered.imagePath, BASIC_VISION_PROMPT, log, "vision_basic_test");
+    const structuredResponse = await callOpenAiVision(rendered.imagePath, STRUCTURED_VISION_PROMPT, log, "vision_structured");
+    const raw = structuredResponse.rawText;
+    const parsed = parseJsonLoose(raw);
+    const structured = parsed || { rawText: raw, parseError: "No se pudo parsear JSON desde la respuesta de Vision." };
     const text = structuredVisionToText(structured) || raw;
     const stats = textStats(text);
     log.push({ phase: "vision_ai", status: stats.useful ? "texto_suficiente" : "texto_insuficiente", chars: stats.chars, words: stats.words });
@@ -366,10 +478,18 @@ async function runOpenAiVision(filePath, log) {
       method: "openai_vision",
       diagnostic: {
         bestVariant: "openai_vision",
-        bestImagePath: filePath,
-        workDir,
+        bestImagePath: rendered.imagePath,
+        workDir: rendered.workDir,
         stats,
+        visionImagePath: rendered.imagePath,
+        visionPrompt: STRUCTURED_VISION_PROMPT,
+        visionBasicPrompt: BASIC_VISION_PROMPT,
+        visionBasicRawResponse: basic.rawText,
+        visionBasicResponseJson: basic.responseJson,
+        visionRawResponse: raw,
+        visionResponseJson: structuredResponse.responseJson,
         visionStructured: structured,
+        visionParseError: parsed ? null : structured.parseError,
         variants: [{ variant: "openai_vision", chars: stats.chars, words: stats.words, useful: stats.useful, blocks: 0, error: null }],
       },
       blocks: [],
@@ -381,8 +501,15 @@ async function runOpenAiVision(filePath, log) {
       method: "openai_vision",
       diagnostic: {
         bestVariant: "openai_vision",
-        bestImagePath: filePath,
-        workDir,
+        bestImagePath: rendered.imagePath,
+        workDir: rendered.workDir,
+        visionImagePath: rendered.imagePath,
+        visionPrompt: STRUCTURED_VISION_PROMPT,
+        visionBasicPrompt: BASIC_VISION_PROMPT,
+        visionBasicRawResponse: null,
+        visionRawResponse: null,
+        visionStructured: null,
+        visionParseError: error.message,
         stats: textStats(""),
         variants: [{ variant: "openai_vision", chars: 0, words: 0, useful: false, blocks: 0, error: error.message }],
       },
@@ -685,8 +812,8 @@ function cleanCuit(value) {
     .replace(/[IiLl]/g, "1")
     .replace(/[Ss]/g, "5")
     .replace(/\D/g, "");
-  if (digits.length < 10 || digits.length > 12) return null;
-  if (digits.length !== 11) return digits;
+  if (digits.length !== 11) return null;
+  if (!isValidCuit(digits)) return null;
   return `${digits.slice(0, 2)}-${digits.slice(2, 10)}-${digits.slice(10)}`;
 }
 
@@ -699,6 +826,16 @@ function findCuits(text) {
     if (cuit && !matches.includes(cuit)) matches.push(cuit);
   }
   return matches;
+}
+
+function isValidCuit(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length !== 11) return false;
+  const weights = [5, 4, 3, 2, 7, 6, 5, 4, 3, 2];
+  const sum = weights.reduce((total, weight, index) => total + Number(digits[index]) * weight, 0);
+  const mod = 11 - (sum % 11);
+  const check = mod === 11 ? 0 : mod === 10 ? 9 : mod;
+  return check === Number(digits[10]);
 }
 
 function findDnis(text) {
@@ -731,11 +868,34 @@ function cleanPhone(value) {
 }
 
 function cleanDate(value) {
-  const match = String(value || "").match(/\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b/);
-  if (!match) return null;
-  const day = match[1].padStart(2, "0");
-  const month = match[2].padStart(2, "0");
-  const year = match[3].length === 2 ? `20${match[3]}` : match[3];
+  const source = stripAccents(String(value || "")).replace(/\s+/g, " ").trim();
+  const monthNames = {
+    ENERO: "01",
+    FEBRERO: "02",
+    MARZO: "03",
+    ABRIL: "04",
+    MAYO: "05",
+    JUNIO: "06",
+    JULIO: "07",
+    AGOSTO: "08",
+    SEPTIEMBRE: "09",
+    SETIEMBRE: "09",
+    OCTUBRE: "10",
+    NOVIEMBRE: "11",
+    DICIEMBRE: "12",
+  };
+  let match = source.match(/\b(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})\b/);
+  if (!match) {
+    match = source.match(/\b(\d{1,2})\s+DE\s+([A-Z]+)(?:\s+DE)?\s+(\d{2,4})\b/i) || source.match(/\b(\d{1,2})\s+([A-Z]+)\s+(\d{2,4})\b/i);
+    if (match) match = [match[0], match[1], monthNames[String(match[2]).toUpperCase()], match[3]];
+  }
+  if (!match || !match[2]) return null;
+  const day = String(match[1]).padStart(2, "0");
+  const month = String(match[2]).padStart(2, "0");
+  const year = String(match[3]).length === 2 ? `20${match[3]}` : String(match[3]);
+  const dayNumber = Number(day);
+  const monthNumber = Number(month);
+  if (dayNumber < 1 || dayNumber > 31 || monthNumber < 1 || monthNumber > 12 || !/^\d{4}$/.test(year)) return null;
   return `${day}/${month}/${year}`;
 }
 
@@ -940,15 +1100,30 @@ function collectUnvalidatedCandidates(text) {
 function valueFromVisionField(data) {
   if (data == null) return null;
   if (typeof data === "object" && !Array.isArray(data)) {
-    if (data.value != null) return safeValue(data.value);
-    if (data.text != null) return safeValue(data.text);
+    if (data.valor != null && typeof data.valor !== "object") return safeValue(data.valor);
+    if (data.value != null && typeof data.value !== "object") return safeValue(data.value);
+    if (data.text != null && typeof data.text !== "object") return safeValue(data.text);
+    if (data.valor != null || data.value != null || data.text != null) return null;
   }
+  if (typeof data === "object") return null;
   return safeValue(data);
+}
+
+function visionFieldCandidate(structured, sourceKeys) {
+  const detected = structured?.detectedFields || structured?.fields || {};
+  for (const sourceKey of sourceKeys) {
+    if (!Object.prototype.hasOwnProperty.call(detected, sourceKey)) continue;
+    const rawField = detected[sourceKey];
+    const value = valueFromVisionField(rawField);
+    if (!value) continue;
+    return field(value, confidenceFromVisionField(rawField), evidenceFromVisionField(rawField), "Extraido por Vision AI.");
+  }
+  return null;
 }
 
 function confidenceFromVisionField(data) {
   if (data && typeof data === "object" && !Array.isArray(data)) {
-    const raw = String(data.confidence || data.confianza || "").toLowerCase().replace(/\s+/g, "_");
+    const raw = String(data.confidence || data.confianza || data.confidenceLevel || "").toLowerCase().replace(/\s+/g, "_");
     if (raw.includes("alta")) return "alta";
     if (raw.includes("media")) return "media";
     if (raw.includes("baja")) return "baja_confianza";
@@ -958,7 +1133,7 @@ function confidenceFromVisionField(data) {
 
 function evidenceFromVisionField(data) {
   if (data && typeof data === "object" && !Array.isArray(data)) {
-    return data.evidence || data.evidencia || data.sourceText || data.raw || null;
+    return data.evidence || data.evidencia || data.observacion || data.observation || data.sourceText || data.raw || null;
   }
   return null;
 }
@@ -967,13 +1142,14 @@ function applyVisionStructuredFields(fields, structured, debug) {
   const detected = structured?.detectedFields || structured?.fields || {};
   const aliases = {
     dominio: ["dominio", "patente", "dominioPatente"],
-    numeroFormulario: ["numeroFormulario", "nroFormulario", "formulario08", "numero_formulario"],
-    fecha: ["fecha", "fechaFormulario", "lugarYFecha"],
-    cuitCuilCompradorAdquirente: ["cuitCuilCompradorAdquirente", "cuitComprador", "cuilComprador", "dniComprador", "documentoComprador"],
-    nombreCompletoCompradorAdquirente: ["nombreCompletoCompradorAdquirente", "comprador", "adquirente", "nombreComprador", "apellidoYNombreComprador"],
+    numeroFormulario: ["numeroFormulario", "numero_formulario_08", "nroFormulario", "formulario08", "numero_formulario"],
+    fecha: ["fecha", "fechaFormulario", "lugarYFecha", "lugar_fecha_impresion_osd"],
+    cuitCuilCompradorAdquirente: ["cuit_adquirente_f08", "cuit_adquirente", "cuitCuilCompradorAdquirente", "cuitComprador", "cuilComprador", "dniComprador", "documentoComprador"],
+    nombreCompletoCompradorAdquirente: ["nombre_adquirente_f08", "nombre_adquirente", "nombreCompletoCompradorAdquirente", "comprador", "adquirente", "nombreComprador", "apellidoYNombreComprador"],
     apellidoCompradorAdquirente: ["apellidoCompradorAdquirente", "apellidoComprador"],
     nombreCompradorAdquirente: ["nombreCompradorAdquirente", "nombreComprador"],
-    domicilio: ["domicilio", "domicilioComprador", "direccionComprador"],
+    domicilio: ["domicilio_adquirente", "domicilio", "domicilioComprador", "direccionComprador"],
+    domicilioLegal: ["domicilioLegal", "domicilio_legal", "direccionLegal", "domicilioVendedor"],
     localidad: ["localidad"],
     provincia: ["provincia"],
     codigoPostal: ["codigoPostal", "cp"],
@@ -986,15 +1162,14 @@ function applyVisionStructuredFields(fields, structured, debug) {
     expediente: ["expediente"],
     registro: ["registro", "registroSeccional"],
     marcaModelo: ["marcaModelo", "marca", "modelo", "marcaYModelo"],
-    anio: ["anio", "ano", "modeloAnio"],
-    cuitCuilVendedor: ["cuitCuilVendedor", "cuitVendedor", "cuilVendedor"],
-    nombreVendedor: ["nombreVendedor", "vendedor"],
-    fechaInicioTramite: ["fechaInicioTramite", "fechaInicio"],
-    montoOperacion: ["montoOperacion", "monto", "precio"],
+    anio: ["anio_fabricacion", "anio", "ano", "modeloAnio", "modelo_anio"],
+    cuitCuilVendedor: ["cuit_vendedor", "cuitCuilVendedor", "cuitVendedor", "cuilVendedor"],
+    nombreVendedor: ["nombre_vendedor", "nombreVendedor", "vendedor"],
+    fechaInicioTramite: ["fecha_inicio_tramite", "fechaInicioTramite", "fechaInicio"],
+    montoOperacion: ["monto_operacion", "montoOperacion", "monto", "precio"],
   };
 
   for (const [targetKey, sourceKeys] of Object.entries(aliases)) {
-    if (fields[targetKey]?.value) continue;
     const sourceKey = sourceKeys.find((key) => Object.prototype.hasOwnProperty.call(detected, key));
     if (!sourceKey) continue;
     const rawField = detected[sourceKey];
@@ -1083,65 +1258,9 @@ function extractDetectedFields(text, sourceFile = "") {
   return { fields: applyRelaxedFallbacks(fields, text, sourceFile, debug), debug };
 }
 
-function buildTemplateOutput(detectedFields) {
-  const valueOf = (key) => detectedFields[key]?.value ?? null;
-  const confidenceOf = (key) => detectedFields[key]?.confidence ?? "baja_confianza";
-  const output = {};
-  const confidence = {};
-
-  for (const placeholder of TEMPLATE_PLACEHOLDERS) {
-    output[placeholder] = null;
-    confidence[placeholder] = "baja_confianza";
-  }
-
-  const assignments = {
-    "@usuario@": "cuitCuilCompradorAdquirente",
-    "@apellido@": "apellidoCompradorAdquirente",
-    "@nombre@": "nombreCompradorAdquirente",
-    "@email@": "correoElectronico",
-    "@atributo8@": "cuitCuilCompradorAdquirente",
-    "@atributo9@": "nombreCompletoCompradorAdquirente",
-    "@atributo7@": "expediente",
-    "@atributo10@": "iniciadorNombre",
-    "@atributo11@": "iniciadorCuitCuil",
-    "@atributo12@": "iniciadorCaracter",
-    "@atributo13@": "registro",
-    "@atributo14@": "numeroFormulario",
-    "@atributo15@": "dominio",
-    "@atributo16@": "domicilio",
-    "@atributo17@": "fecha",
-    "@atributo18@": "marcaModelo",
-    "@atributo19@": "anio",
-    "@atributo20@": "anio",
-    "@atributo21@": "cuitCuilVendedor",
-    "@atributo22@": "nombreVendedor",
-    "@atributo30@": "fechaInicioTramite",
-    "@atributo33@": "montoOperacion",
-  };
-
-  for (const [placeholder, sourceKey] of Object.entries(assignments)) {
-    output[placeholder] = valueOf(sourceKey);
-    confidence[placeholder] = confidenceOf(sourceKey);
-  }
-
-  return { output, confidence };
-}
-
-function isAutomaticFallbackValue(value) {
-  return /\b(NO TIENE|SIN DATOS|N\/A|NA|NO APLICA|NO CORRESPONDE)\b/.test(stripAccents(String(value || "")).toUpperCase());
-}
-
-function isValidIniciadorValue(value) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  return text.length >= 3 && !isAutomaticFallbackValue(text);
-}
-
 function findTemplate() {
-  const templates = fs.readdirSync(TEMPLATE_DIR).filter((name) => /\.ods$/i.test(name)).sort();
-  if (templates.length !== 1) {
-    throw new Error(`Debe haber exactamente una plantilla .ods en ${TEMPLATE_DIR}. Encontradas: ${templates.length}`);
-  }
-  return path.join(TEMPLATE_DIR, templates[0]);
+  if (fs.existsSync(TEMPLATE_ODS_PATH)) return TEMPLATE_ODS_PATH;
+  throw new Error(`No existe el template oficial requerido: ${TEMPLATE_ODS_PATH}`);
 }
 
 function copyDebugFile(sourcePath, targetPath, log, label) {
@@ -1160,166 +1279,657 @@ function copyDebugFile(sourcePath, targetPath, log, label) {
   }
 }
 
-function getRepeatedCount(cellXml) {
-  const repeat = cellXml.match(/\stable:number-columns-repeated="(\d+)"/);
-  return repeat ? Number(repeat[1]) : 1;
+function pickVisionField(diagnostic, names) {
+  const fields = diagnostic?.visionStructured?.detectedFields || diagnostic?.visionStructured?.fields || {};
+  for (const name of names) {
+    const item = fields[name];
+    if (item == null) continue;
+    if (typeof item === "object" && item.value != null) return item.value;
+    if (typeof item !== "object") return item;
+  }
+  return null;
 }
 
-function removeRepeatedCount(cellXml) {
-  return cellXml.replace(/\stable:number-columns-repeated="\d+"/, "");
+function buildEasyOcrVisionComparison(easyOcrParsed, diagnostic) {
+  const fields = easyOcrParsed?.fields || {};
+  const vision = {
+    dominio: pickVisionField(diagnostic, ["dominio", "patente"]),
+    fecha: pickVisionField(diagnostic, ["fecha", "fechaOperacion", "fechaInicioTramite"]),
+    monto: pickVisionField(diagnostic, ["monto", "montoOperacion", "precio"]),
+    cuit: pickVisionField(diagnostic, ["cuit", "cuitCuilCompradorAdquirente", "cuitCuilVendedor"]),
+    nombre: pickVisionField(diagnostic, ["nombre", "nombreCompletoCompradorAdquirente", "nombreVendedor"]),
+  };
+  return Object.fromEntries(
+    Object.entries(vision).map(([key, visionValue]) => [
+      key,
+      {
+        easyocr: fields[key]?.value || null,
+        vision: visionValue || null,
+        comparable: Boolean(fields[key]?.value || visionValue),
+        match: Boolean(fields[key]?.value && visionValue && String(fields[key].value).trim().toLowerCase() === String(visionValue).trim().toLowerCase()),
+      },
+    ])
+  );
 }
 
-function getOdsRows(contentXml) {
-  return [...contentXml.matchAll(/<table:table-row\b[\s\S]*?<\/table:table-row>/g)].map((match) => ({
-    index: match.index,
-    xml: match[0],
-  }));
-}
+function runEasyOcrDebug(inputImagePath, files, diagnostic, log) {
+  if (!EASY_OCR_ENABLED) return null;
 
-function splitOdsRow(rowXml) {
-  const open = rowXml.match(/^<table:table-row\b[^>]*>/);
-  if (!open) throw new Error("Fila ODS invalida.");
-  const openTag = open[0];
-  const closeTag = "</table:table-row>";
-  const inner = rowXml.slice(openTag.length, -closeTag.length);
-  return { openTag, inner, closeTag };
-}
-
-function parseOdsCells(rowXml) {
-  const { openTag, closeTag, inner } = splitOdsRow(rowXml);
-  const cellMatches = [
-    ...inner.matchAll(
-      /<table:(?:table-cell|covered-table-cell)\b[^>]*\/>|<table:(?:table-cell|covered-table-cell)\b[^>]*>[\s\S]*?<\/table:(?:table-cell|covered-table-cell)>/g
-    ),
-  ];
-  const cells = [];
-
-  for (const match of cellMatches) {
-    const repeat = getRepeatedCount(match[0]);
-    const cellXml = removeRepeatedCount(match[0]);
-    for (let i = 0; i < repeat; i += 1) {
-      cells.push(cellXml);
-    }
+  if (!inputImagePath || !fs.existsSync(inputImagePath) || imageSizeBytes(inputImagePath) < VISION_MIN_IMAGE_BYTES) {
+    const payload = {
+      ok: false,
+      engine: "easyocr",
+      error: "input_page_1.png no existe o pesa menos de 1 KB",
+      fields: { dominio: null, fecha: null, monto: null, cuit: null, nombre: null },
+    };
+    fs.writeFileSync(files.easyOcrRawResponse, payload.error, "utf8");
+    fs.writeFileSync(files.easyOcrParsedJson, JSON.stringify(payload, null, 2), "utf8");
+    log.push({ phase: "easyocr", status: "sin_imagen_valida", value: payload.error });
+    return payload;
   }
 
-  return { openTag, closeTag, cells };
+  try {
+    execFileSync("python", [EASYOCR_PROBE_PATH, inputImagePath, files.easyOcrRawResponse, files.easyOcrParsedJson], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 180000,
+    });
+    const parsed = JSON.parse(fs.readFileSync(files.easyOcrParsedJson, "utf8"));
+    parsed.comparison = buildEasyOcrVisionComparison(parsed, diagnostic);
+    fs.writeFileSync(files.easyOcrParsedJson, JSON.stringify(parsed, null, 2), "utf8");
+    log.push({ phase: "easyocr", status: parsed.ok ? "ok" : "error", value: files.easyOcrParsedJson, lines: parsed.lineCount || 0 });
+    return parsed;
+  } catch (error) {
+    let parsed = null;
+    if (fs.existsSync(files.easyOcrParsedJson)) {
+      try {
+        parsed = JSON.parse(fs.readFileSync(files.easyOcrParsedJson, "utf8"));
+      } catch (_) {
+        parsed = null;
+      }
+    }
+    const payload = parsed || {
+      ok: false,
+      engine: "easyocr",
+      error: error.stderr || error.message,
+      fields: { dominio: null, fecha: null, monto: null, cuit: null, nombre: null },
+    };
+    payload.comparison = buildEasyOcrVisionComparison(payload, diagnostic);
+    fs.writeFileSync(files.easyOcrRawResponse, fs.existsSync(files.easyOcrRawResponse) ? fs.readFileSync(files.easyOcrRawResponse, "utf8") : payload.error, "utf8");
+    fs.writeFileSync(files.easyOcrParsedJson, JSON.stringify(payload, null, 2), "utf8");
+    log.push({ phase: "easyocr", status: "error", value: payload.error });
+    return payload;
+  }
+}
+
+async function writeDebugArtifacts(debugRunDir, result, log) {
+  const diagnostic = result.ocrDiagnostic || {};
+  let visionImagePath = diagnostic.visionImagePath || diagnostic.bestImagePath;
+  let temporaryVisionRender = null;
+  if ((!visionImagePath || !fs.existsSync(visionImagePath) || !/^image\//.test(mimeTypeFor(visionImagePath))) && result.sourcePath) {
+    temporaryVisionRender = await renderFirstPageForVision(result.sourcePath, log);
+    if (temporaryVisionRender.imagePath) visionImagePath = temporaryVisionRender.imagePath;
+  }
+  const files = {
+    inputImage: path.join(debugRunDir, "input_page_1.png"),
+    prompt: path.join(debugRunDir, "vision_prompt.txt"),
+    rawResponse: path.join(debugRunDir, "vision_raw_response.txt"),
+    parsedJson: path.join(debugRunDir, "vision_parsed.json"),
+    validation: path.join(debugRunDir, "validation_report.json"),
+    mapping: path.join(debugRunDir, "full_mapping.json"),
+    outputMapping: path.join(debugRunDir, "output_mapping.json"),
+    fullExtraction: path.join(debugRunDir, "full_extraction.json"),
+    allowedFieldsMapping: path.join(debugRunDir, "allowed_fields_mapping.json"),
+    basicPrompt: path.join(debugRunDir, "vision_basic_prompt.txt"),
+    basicResponse: path.join(debugRunDir, "vision_basic_raw_response.txt"),
+    easyOcrRawResponse: path.join(debugRunDir, "easyocr_raw_response.txt"),
+    easyOcrParsedJson: path.join(debugRunDir, "easyocr_parsed.json"),
+  };
+
+  copyDebugFile(visionImagePath, files.inputImage, log, "vision_input_page_1");
+  result.easyOcrComparison = runEasyOcrDebug(files.inputImage, files, diagnostic, log);
+  fs.writeFileSync(files.prompt, diagnostic.visionPrompt || STRUCTURED_VISION_PROMPT, "utf8");
+  fs.writeFileSync(files.basicPrompt, diagnostic.visionBasicPrompt || BASIC_VISION_PROMPT, "utf8");
+  fs.writeFileSync(files.basicResponse, diagnostic.visionBasicRawResponse || "", "utf8");
+  fs.writeFileSync(
+    files.rawResponse,
+    diagnostic.visionResponseJson ? JSON.stringify(diagnostic.visionResponseJson) : diagnostic.visionRawResponse || "",
+    "utf8"
+  );
+  fs.writeFileSync(files.parsedJson, JSON.stringify(diagnostic.visionStructured || { parseError: diagnostic.visionParseError || "sin_respuesta_parseada" }, null, 2), "utf8");
+  fs.writeFileSync(files.validation, JSON.stringify(result.validationReport || {}, null, 2), "utf8");
+  fs.writeFileSync(files.mapping, JSON.stringify(result.fullMapping || result.outputMapping || {}, null, 2), "utf8");
+  fs.writeFileSync(files.outputMapping, JSON.stringify(result.outputMapping || {}, null, 2), "utf8");
+  fs.writeFileSync(files.fullExtraction, JSON.stringify(result.fullExtraction || {}, null, 2), "utf8");
+  fs.writeFileSync(files.allowedFieldsMapping, JSON.stringify(result.allowedFieldsMapping || {}, null, 2), "utf8");
+
+  log.push({ phase: "debug_file", status: "escrito", field: "vision_prompt", value: files.prompt });
+  log.push({ phase: "debug_file", status: "escrito", field: "vision_raw_response", value: files.rawResponse });
+  log.push({ phase: "debug_file", status: "escrito", field: "vision_parsed", value: files.parsedJson });
+  log.push({ phase: "debug_file", status: "escrito", field: "validation_report", value: files.validation });
+  log.push({ phase: "debug_file", status: "escrito", field: "full_mapping", value: files.mapping });
+  log.push({ phase: "debug_file", status: "escrito", field: "output_mapping", value: files.outputMapping });
+  log.push({ phase: "debug_file", status: "escrito", field: "full_extraction", value: files.fullExtraction });
+  log.push({ phase: "debug_file", status: "escrito", field: "allowed_fields_mapping", value: files.allowedFieldsMapping });
+  log.push({ phase: "debug_file", status: "escrito", field: "vision_basic_prompt", value: files.basicPrompt });
+  log.push({ phase: "debug_file", status: "escrito", field: "vision_basic_raw_response", value: files.basicResponse });
+  if (EASY_OCR_ENABLED) {
+    log.push({ phase: "debug_file", status: "escrito", field: "easyocr_raw_response", value: files.easyOcrRawResponse });
+    log.push({ phase: "debug_file", status: "escrito", field: "easyocr_parsed", value: files.easyOcrParsedJson });
+  }
+  if (temporaryVisionRender?.workDir) {
+    fs.rmSync(temporaryVisionRender.workDir, { recursive: true, force: true });
+  }
+  return files;
+}
+
+function excelCellText(cell) {
+  const value = cell.value;
+  if (value == null) return "";
+  if (typeof value === "object") {
+    if (value.formula) return "[formula]";
+    if (value.richText) return value.richText.map((part) => part.text).join("");
+    if (value.text) return value.text;
+    if (value.result != null) return String(value.result);
+  }
+  return String(value);
+}
+
+const AUTOMATIC_FIELD_CONFIG = {
+  cuit_adquirente: { headers: ["CUIT ADQUIRENTE"], aliases: ["cuit_adquirente", "cuitCuilCompradorAdquirente"], validation: "cuit" },
+  nombre_adquirente: { headers: ["NOMBRE ADQUIRENTE"], aliases: ["nombre_adquirente", "nombreCompletoCompradorAdquirente"], validation: "text" },
+  email: { headers: ["EMAIL F 08 APARTADO D"], aliases: ["email", "correoElectronico", "mail"], validation: "email" },
+  cuit_adquirente_f08: { headers: ["CUIT ADQUIRIENTE"], aliases: ["cuit_adquirente_f08", "cuit_adquirente", "cuitCuilCompradorAdquirente"], validation: "cuit" },
+  nombre_adquirente_f08: { headers: ["NOMBRE ADQUIRIENTE"], aliases: ["nombre_adquirente_f08", "nombre_adquirente", "nombreCompletoCompradorAdquirente"], validation: "text" },
+  numero_formulario_08: { headers: ["NRO FORMULARIO 08"], aliases: ["numero_formulario_08", "numeroFormulario", "nroFormulario"], validation: "text" },
+  dominio: { headers: ["DOMINIO"], aliases: ["dominio", "patente", "dominioPatente"], validation: "domain" },
+  domicilio_adquirente: { headers: ["DOMICILIO ADQUIRIENTE"], aliases: ["domicilio_adquirente", "domicilio", "domicilioComprador"], validation: "text" },
+  lugar_fecha_impresion_osd: { headers: ["LUGARY FECHA DE IMPRESIDN DEL OSD:"], aliases: ["lugar_fecha_impresion_osd", "fecha", "fechaFormulario", "lugarYFecha"], validation: "date" },
+  marca: { headers: ["MARCA, MODELO, TIPO (F.08/TOAD)"], aliases: ["marca", "marcaModelo", "marcaYModelo"], validation: "text", sharedCellGroup: "marca_modelo_tipo" },
+  modelo: { headers: ["MARCA, MODELO, TIPO (F.08/TOAD)"], aliases: ["modelo", "marcaModelo", "marcaYModelo"], validation: "text", sharedCellGroup: "marca_modelo_tipo" },
+  modelo_anio: { headers: ["MODELO (TAX-AÑO DE FABRICACIÓN)"], aliases: ["modelo_anio", "modeloAnio", "modeloAno"], validation: "text" },
+  anio_fabricacion: { headers: ["ANIO (TAX-AÑO DE FABRICACIÓN)"], aliases: ["anio_fabricacion", "anio", "ano"], validation: "year" },
+  cuit_vendedor: { headers: ["CUIT VENDEDOR (F.08)"], aliases: ["cuit_vendedor", "cuitCuilVendedor", "cuitVendedor", "cuilVendedor"], validation: "cuit" },
+  nombre_vendedor: { headers: ["NOMBRE VENDEDOR"], aliases: ["nombre_vendedor", "nombreVendedor", "vendedor"], validation: "text" },
+  letra_multa: { headers: ["LETRA MULTA"], aliases: ["letra_multa"], validation: "text" },
+  fecha_liquidacion: { headers: ["FECHA DE LIQUIDACIÓN (HOY)"], aliases: ["fecha_liquidacion"], validation: "date" },
+  fecha_inicio_tramite: { headers: ["FECHA INICIO TRÁMITE"], aliases: ["fecha_inicio_tramite", "fechaInicioTramite", "fechaInicio"], validation: "date" },
+  periodo: { headers: ["PERÍODO F. 08"], aliases: ["periodo"], validation: "text" },
+  monto_operacion: { headers: ["MONTO OPERACION"], aliases: ["monto_operacion", "montoOperacion", "monto", "precio"], validation: "amount" },
+};
+
+const NON_AUTOMATIC_COLUMNS = [
+  { field: "remito_sinavico", headers: ["REMOTO SI/NO/VACIO", "REMITO SINAVICO"], tipo: "manual", rule: "NO PONER" },
+  { field: "resolucion", headers: ["RESOLUCIÓN"], tipo: "manual" },
+  { field: "tramite", headers: ["TRAMITE"], tipo: "manual" },
+  { field: "indicador_titular_suplente", headers: ["INICIADOR (TITULAR/SUPLENTE)"], tipo: "manual" },
+  { field: "cuit_iniciador", headers: ["CUIT INICIADOR"], tipo: "manual" },
+  { field: "caracter", headers: ["CARÁCTER"], tipo: "fijo_template" },
+  { field: "registro", headers: ["REGISTRO"], tipo: "fijo_template" },
+  { field: "impuesto", headers: ["$ IMPUESTO"], tipo: "manual" },
+  { field: "intereses", headers: ["$ INTERESES"], tipo: "manual" },
+  { field: "sintesis_multa", headers: ["% MULTA (DOBLE)"], tipo: "manual" },
+  { field: "multa", headers: ["$ MULTA"], tipo: "manual" },
+  { field: "total", headers: ["TOTAL"], tipo: "manual" },
+  { field: "avaluo", headers: ["AVALUO DNRPA (TOAD)"], tipo: "manual" },
+  { field: "mayor_valor", headers: ["MAYOR VALOR"], tipo: "formula" },
+  { field: "alicuota", headers: ["ALÍCUOTA"], tipo: "formula" },
+  { field: "impuesto_determinado", headers: ["IMPUESTO DETERMINADO"], tipo: "fijo_template" },
+];
+
+function normalizeHeaderKey(value) {
+  return stripAccents(String(value || "")).replace(/\s+/g, " ").trim().toUpperCase();
+}
+
+function columnLetter(columnNumber) {
+  let value = columnNumber;
+  let name = "";
+  while (value > 0) {
+    const mod = (value - 1) % 26;
+    name = String.fromCharCode(65 + mod) + name;
+    value = Math.floor((value - mod) / 26);
+  }
+  return name;
+}
+
+function cellHasFormula(cell) {
+  return Boolean(cell?.formula || (cell?.value && typeof cell.value === "object" && cell.value.formula));
+}
+
+function xmlDecode(value) {
+  return String(value || "")
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&#([0-9]+);/g, (_, code) => String.fromCodePoint(parseInt(code, 10)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&gt;/g, ">")
+    .replace(/&lt;/g, "<")
+    .replace(/&amp;/g, "&");
+}
+
+function xmlEscape(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function findIllegalXmlCharacter(value) {
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    const codePoint = text.codePointAt(index);
+    if (codePoint > 0xffff) index += 1;
+    const legal =
+      codePoint === 0x9 ||
+      codePoint === 0xa ||
+      codePoint === 0xd ||
+      (codePoint >= 0x20 && codePoint <= 0xd7ff) ||
+      (codePoint >= 0xe000 && codePoint <= 0xfffd) ||
+      (codePoint >= 0x10000 && codePoint <= 0x10ffff);
+    if (!legal) return { index, codePoint };
+  }
+  return null;
+}
+
+function validateXml(xml) {
+  let parseError = null;
+  const parser = new SaxesParser({ xmlns: false });
+  parser.onerror = (error) => {
+    parseError = {
+      message: error.message,
+      line: parser.line + 1,
+      column: parser.column + 1,
+    };
+  };
+  try {
+    parser.write(xml).close();
+  } catch (error) {
+    if (!parseError) {
+      parseError = {
+        message: error.message,
+        line: parser.line + 1,
+        column: parser.column + 1,
+      };
+    }
+  }
+  return parseError ? { ok: false, ...parseError } : { ok: true, message: "content.xml valido" };
+}
+
+function formulaSnapshot(xml) {
+  return [...String(xml).matchAll(/\btable:formula="([^"]*)"/g)].map((match) => match[1]);
+}
+
+function extractTableXml(contentXml, worksheetName) {
+  const escapedName = worksheetName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = contentXml.match(new RegExp(`<table:table\\b[^>]*table:name="${escapedName}"[^>]*>[\\s\\S]*?<\\/table:table>`));
+  if (!match) throw new Error(`ODS invalido: no se encontro la hoja ${worksheetName}.`);
+  return { xml: match[0], start: match.index };
+}
+
+function extractRowXml(tableXml, rowNumber) {
+  const rows = [...tableXml.matchAll(/<table:table-row\b[\s\S]*?<\/table:table-row>/g)];
+  const row = rows[rowNumber - 1];
+  if (!row) throw new Error(`ODS invalido: no se encontro la fila ${rowNumber}.`);
+  return { xml: row[0], start: row.index };
+}
+
+function tokenizeOdsCells(rowXml) {
+  return [...rowXml.matchAll(/<table:(?:table-cell|covered-table-cell)\b[^>]*\/>|<table:(?:table-cell|covered-table-cell)\b[^>]*>[\s\S]*?<\/table:(?:table-cell|covered-table-cell)>/g)].map((match) => {
+    const repeated = match[0].match(/\btable:number-columns-repeated="(\d+)"/);
+    return { xml: match[0], start: match.index, count: repeated ? Number(repeated[1]) : 1 };
+  });
 }
 
 function odsCellText(cellXml) {
-  if (/table:formula=/.test(cellXml)) return "[formula]";
-  if (/office:value=/.test(cellXml) || /office:string-value=/.test(cellXml) || /office:date-value=/.test(cellXml)) {
-    const text = [...cellXml.matchAll(/<text:p[^>]*>([\s\S]*?)<\/text:p>|<text:p\s*\/>/g)]
-      .map((match) => match[1] || "")
-      .join("")
+  return xmlDecode(
+    String(cellXml || "")
+      .replace(/<text:s(?:\s[^>]*)?\/>/g, " ")
+      .replace(/<text:tab(?:\s[^>]*)?\/>/g, "\t")
+      .replace(/<text:line-break(?:\s[^>]*)?\/>/g, "\n")
       .replace(/<[^>]+>/g, "")
-      .trim();
-    return text || "[value]";
-  }
-  return [...cellXml.matchAll(/<text:p[^>]*>([\s\S]*?)<\/text:p>|<text:p\s*\/>/g)]
-    .map((match) => match[1] || "")
-    .join("")
-    .replace(/<text:s\s*\/>/g, " ")
-    .replace(/<[^>]+>/g, "")
-    .trim();
+  ).trim();
 }
 
-function odsPlaceholderFromCell(cellXml) {
-  return unescapeXml(odsCellText(cellXml));
+function removeRepeatedAttribute(cellXml) {
+  return cellXml.replace(/\s+table:number-columns-repeated="\d+"/, "");
 }
 
-function makeOdsCell(value, placeholder) {
-  if (typeof value === "number") {
-    return `<table:table-cell office:value-type="float" office:value="${value}" calcext:value-type="float"><text:p>${value}</text:p></table:table-cell>`;
-  }
-  if (DATE_PLACEHOLDERS.has(placeholder)) {
-    const text = escapeXml(formatDateDdMmYy(value));
-    return `<table:table-cell office:value-type="string" calcext:value-type="string"><text:p>${text}</text:p></table:table-cell>`;
-  }
-  const text = escapeXml(value);
-  return `<table:table-cell office:value-type="string" calcext:value-type="string"><text:p>${text}</text:p></table:table-cell>`;
+function withRepeatedCount(cellXml, count) {
+  const base = removeRepeatedAttribute(cellXml);
+  if (count <= 1) return base;
+  return base.replace(/^(<table:(?:table-cell|covered-table-cell)\b)/, `$1 table:number-columns-repeated="${count}"`);
 }
 
-function writeOdsDataRow(targetRow, rowData, columns, targetRowNumber, log) {
-  const requiredCols = Math.max(...columns.map((column) => column.colNumber));
-  while (targetRow.cells.length < requiredCols) {
-    targetRow.cells.push("<table:table-cell/>");
+function replaceOdsCell(rowXml, columnNumber, replaceCell) {
+  const cells = tokenizeOdsCells(rowXml);
+  let currentColumn = 1;
+  for (let index = 0; index < cells.length; index += 1) {
+    const token = cells[index];
+    const endColumn = currentColumn + token.count - 1;
+    if (columnNumber >= currentColumn && columnNumber <= endColumn) {
+      const offset = columnNumber - currentColumn;
+      const before = offset;
+      const after = token.count - offset - 1;
+      const singleCellXml = removeRepeatedAttribute(token.xml);
+      const replacement = replaceCell(singleCellXml);
+      const parts = [];
+      if (before > 0) parts.push(withRepeatedCount(singleCellXml, before));
+      parts.push(replacement);
+      if (after > 0) parts.push(withRepeatedCount(singleCellXml, after));
+      return rowXml.slice(0, token.start) + parts.join("") + rowXml.slice(token.start + token.xml.length);
+    }
+    currentColumn = endColumn + 1;
+  }
+  throw new Error(`ODS invalido: no se encontro la columna ${columnNumber} en la fila destino.`);
+}
+
+function odsCellAt(rowXml, columnNumber) {
+  let currentColumn = 1;
+  for (const token of tokenizeOdsCells(rowXml)) {
+    const endColumn = currentColumn + token.count - 1;
+    if (columnNumber >= currentColumn && columnNumber <= endColumn) return removeRepeatedAttribute(token.xml);
+    currentColumn = endColumn + 1;
+  }
+  return null;
+}
+
+function buildOdsCellXml(cellXml, value, validation) {
+  if (/\btable:formula=/.test(cellXml)) return null;
+  const illegal = findIllegalXmlCharacter(value);
+  if (illegal) {
+    throw new Error(`Valor rechazado: caracter XML ilegal U+${illegal.codePoint.toString(16).toUpperCase().padStart(4, "0")} en posicion ${illegal.index}.`);
+  }
+  const isAmount = validation === "amount";
+  const serialized = isAmount ? String(Number(value)) : String(value);
+  const openingMatch = cellXml.match(/^<table:(?:table-cell|covered-table-cell)\b[^>]*\/?>/);
+  if (!openingMatch) throw new Error("ODS invalido: celda destino sin apertura XML reconocible.");
+  let opening = openingMatch[0]
+    .replace(/\/>$/, ">")
+    .replace(/\s+(?:office:value-type|office:value|office:string-value|office:date-value|calcext:value-type)="[^"]*"/g, "");
+  opening = opening.replace(
+    />$/,
+    isAmount
+      ? ` office:value-type="float" office:value="${xmlEscape(serialized)}" calcext:value-type="float">`
+      : ` office:value-type="string" calcext:value-type="string">`
+  );
+  return `${opening}<text:p>${xmlEscape(serialized)}</text:p></table:table-cell>`;
+}
+
+async function loadOdsContent(templatePath) {
+  const archive = await JSZip.loadAsync(fs.readFileSync(templatePath));
+  const contentEntry = archive.file("content.xml");
+  if (!contentEntry) throw new Error("ODS invalido: falta content.xml.");
+  return { archive, contentXml: await contentEntry.async("string") };
+}
+
+async function buildAllowedFieldsMapping(templatePath) {
+  const { contentXml } = await loadOdsContent(templatePath);
+  const worksheetNameMatch = contentXml.match(/<table:table\b[^>]*table:name="([^"]+)"/);
+  if (!worksheetNameMatch) throw new Error("ODS invalido: no contiene hojas.");
+  const worksheetName = xmlDecode(worksheetNameMatch[1]);
+  const tableXml = extractTableXml(contentXml, worksheetName).xml;
+  const headerRowXml = extractRowXml(tableXml, 1).xml;
+  const targetRowXml = extractRowXml(tableXml, 3).xml;
+  const headerIndex = new Map();
+  let col = 1;
+  for (const token of tokenizeOdsCells(headerRowXml)) {
+    const header = odsCellText(token.xml);
+    if (header) {
+      headerIndex.set(normalizeHeaderKey(header), { header, col, column: columnLetter(col), cell: `${columnLetter(col)}3` });
+    }
+    col += token.count;
   }
 
-  for (const { placeholder, colNumber } of columns) {
-    const cellIndex = colNumber - 1;
-    const address = `${columnName(colNumber)}${targetRowNumber}`;
-    const existingXml = targetRow.cells[cellIndex] || "<table:table-cell/>";
-    const existing = odsCellText(existingXml);
-
-    if (NEVER_FILL.has(placeholder)) {
-      log.push({ phase: "write_ods", placeholder, cell: address, status: "omitido_no_completar", value: "" });
-      continue;
-    }
-
-    const value = rowData[placeholder] ?? "";
-    if (existing !== "") {
-      log.push({ phase: "write_ods", placeholder, cell: address, status: "omitido_celda_ocupada", value, existing });
-      continue;
-    }
-
-    if (placeholder === INICIADOR_PLACEHOLDER && !isValidIniciadorValue(value)) {
-      log.push({ phase: "write_ods", placeholder, cell: address, status: "omitido_iniciador_sin_valor", value: "" });
-      continue;
-    }
-
-    const cleanValue = DATE_PLACEHOLDERS.has(placeholder) ? formatDateDdMmYy(value) : value;
-    targetRow.cells[cellIndex] = cleanValue === "" ? "<table:table-cell/>" : makeOdsCell(cleanValue, placeholder);
-    log.push({
-      phase: "write_ods",
-      placeholder,
-      cell: address,
-      status: cleanValue === "" ? "escrito_vacio_no_encontrado" : "escrito",
-      value: cleanValue,
+  const mapping = [];
+  for (const fieldName of AUTOMATIC_FIELD_ORDER) {
+    const config = AUTOMATIC_FIELD_CONFIG[fieldName];
+    const match = (config.headers || []).map(normalizeHeaderKey).map((header) => headerIndex.get(header)).find(Boolean) || null;
+    const targetCell = match ? odsCellAt(targetRowXml, match.col) : null;
+    const hasFormula = targetCell ? /\btable:formula=/.test(targetCell) : false;
+    mapping.push({
+      campo: fieldName,
+      encabezado_excel: match?.header || null,
+      columna: match?.column || null,
+      celda_destino: match?.cell || null,
+      tipo: hasFormula ? "formula" : match ? "automatico" : "manual",
+      regla: hasFormula ? "FORMULA" : match ? "automatico" : "sin_columna_en_template",
+      aliases: config.aliases,
+      validation: config.validation,
+      sharedCellGroup: config.sharedCellGroup || null,
     });
   }
 
-  log.push({ phase: "write_ods", field: "ods_row", status: "completado", value: targetRowNumber });
-  return `${targetRow.openTag}${targetRow.cells.join("")}${targetRow.closeTag}`;
+  for (const config of NON_AUTOMATIC_COLUMNS) {
+    const match = (config.headers || []).map(normalizeHeaderKey).map((header) => headerIndex.get(header)).find(Boolean) || null;
+    if (!match) continue;
+    const targetCell = odsCellAt(targetRowXml, match.col);
+    const hasFormula = /\btable:formula=/.test(targetCell);
+    mapping.push({
+      campo: config.field,
+      encabezado_excel: match.header,
+      columna: match.column,
+      celda_destino: match.cell,
+      tipo: hasFormula ? "formula" : config.tipo,
+      regla: config.rule || (hasFormula ? "FORMULA" : config.tipo),
+    });
+  }
+
+  return {
+    template: templatePath,
+    worksheet: worksheetName,
+    fields: mapping,
+  };
 }
 
-async function writeOdsWorkbook(templatePath, rowData, outPath, log) {
-  const buffer = fs.readFileSync(templatePath);
-  const zip = await JSZip.loadAsync(buffer);
-  const contentFile = zip.file("content.xml");
-  if (!contentFile) throw new Error("ODS invalido: no contiene content.xml.");
+async function writeAllowedFieldsMappingDebug(templatePath) {
+  const mapping = await buildAllowedFieldsMapping(templatePath);
+  fs.writeFileSync(ALLOWED_FIELDS_MAPPING_DEBUG_PATH, JSON.stringify(mapping, null, 2), "utf8");
+  return mapping;
+}
 
-  const contentXml = await contentFile.async("string");
-  const rows = getOdsRows(contentXml);
-  if (rows.length < FIRST_DATA_ROW) {
-    throw new Error(`ODS invalido: no existen filas suficientes. Ultima fila requerida: ${FIRST_DATA_ROW}.`);
+async function readBackXlsxCells(xlsxPath, cellAddresses = []) {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(xlsxPath);
+  const worksheet = workbook.worksheets[0];
+  if (!worksheet) throw new Error("XLSX invalido: no contiene hojas.");
+  const cells = {};
+  for (const cellAddress of cellAddresses) {
+    const value = worksheet.getCell(cellAddress).value;
+    cells[cellAddress] = value && typeof value === "object" && value.text ? value.text : value;
   }
+  return {
+    file: xlsxPath,
+    worksheet: worksheet.name,
+    cells,
+  };
+}
 
-  const placeholderRow = parseOdsCells(rows[PLACEHOLDER_ROW - 1].xml);
-  const expected = new Set([...TEMPLATE_PLACEHOLDERS, ...NEVER_FILL]);
-  const columns = [];
+async function readBackOdsCells(odsPath, worksheetName, cellAddresses = []) {
+  const { contentXml } = await loadOdsContent(odsPath);
+  const rowXml = extractRowXml(extractTableXml(contentXml, worksheetName).xml, 3).xml;
+  const cells = {};
+  for (const cellAddress of cellAddresses) {
+    const column = cellAddress.match(/^[A-Z]+/)[0]
+      .split("")
+      .reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0);
+    cells[cellAddress] = odsCellText(odsCellAt(rowXml, column));
+  }
+  return { file: odsPath, worksheet: worksheetName, cells, formulas: formulaSnapshot(contentXml) };
+}
 
-  placeholderRow.cells.forEach((cellXml, index) => {
-    const placeholder = odsPlaceholderFromCell(cellXml);
-    if (expected.has(placeholder)) {
-      columns.push({ placeholder, colNumber: index + 1 });
+function odsXmlValidationReport(originalXml, generatedXml) {
+  const originalValidation = validateXml(originalXml);
+  const generatedValidation = validateXml(generatedXml);
+  const originalFormulas = formulaSnapshot(originalXml);
+  const generatedFormulas = formulaSnapshot(generatedXml);
+  return {
+    originalContentXml: originalValidation,
+    generatedContentXml: generatedValidation,
+    formulasPreserved: JSON.stringify(originalFormulas) === JSON.stringify(generatedFormulas),
+    originalFormulaCount: originalFormulas.length,
+    generatedFormulaCount: generatedFormulas.length,
+    numeroaletrasPreserved: generatedFormulas.some((formula) => /NUMEROALETRAS/i.test(xmlDecode(formula))),
+  };
+}
+
+function formatOdsValidationReport(report) {
+  const lines = [
+    `original_content.xml: ${report.originalContentXml.ok ? "VALIDO" : "INVALIDO"}`,
+    `generated_content.xml: ${report.generatedContentXml.ok ? "VALIDO" : "INVALIDO"}`,
+    `formulas_preserved: ${report.formulasPreserved ? "SI" : "NO"}`,
+    `formula_count_original: ${report.originalFormulaCount}`,
+    `formula_count_generated: ${report.generatedFormulaCount}`,
+    `numeroaletras_preserved: ${report.numeroaletrasPreserved ? "SI" : "NO"}`,
+  ];
+  if (!report.generatedContentXml.ok) {
+    lines.push(`error: ${report.generatedContentXml.message}`);
+    lines.push(`linea: ${report.generatedContentXml.line}`);
+    lines.push(`columna: ${report.generatedContentXml.column}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+async function writeOdsWorkbook(templatePath, outPath, debugRunDir, log, fullExtraction, allowedFieldsMapping) {
+  const { archive, contentXml: originalXml } = await loadOdsContent(templatePath);
+  const xmlDebugDir = path.join(debugRunDir, "xml");
+  fs.mkdirSync(xmlDebugDir, { recursive: true });
+  const originalXmlPath = path.join(xmlDebugDir, "original_content.xml");
+  const generatedXmlPath = path.join(xmlDebugDir, "generated_content.xml");
+  const validationReportPath = path.join(xmlDebugDir, "xml_validation_report.txt");
+  fs.writeFileSync(originalXmlPath, originalXml, "utf8");
+
+  const table = extractTableXml(originalXml, allowedFieldsMapping.worksheet);
+  const row = extractRowXml(table.xml, 3);
+  let generatedRowXml = row.xml;
+  const mapping = {};
+  const writeGroups = new Map();
+  for (const mapItem of allowedFieldsMapping.fields || []) {
+    if (mapItem.tipo !== "automatico" || !mapItem.celda_destino) continue;
+    const extraction = fullExtraction.fields?.[mapItem.campo];
+    if (!extraction || !["validado", "revisar"].includes(extraction.estado)) continue;
+    if (!writeGroups.has(mapItem.celda_destino)) {
+      writeGroups.set(mapItem.celda_destino, { fields: [], values: [], validation: mapItem.validation, column: mapItem.columna });
     }
-  });
-
-  if (columns.length < 5) {
-    throw new Error(`No se encontraron placeholders suficientes en la fila ${PLACEHOLDER_ROW} del ODS.`);
+    const group = writeGroups.get(mapItem.celda_destino);
+    group.fields.push(mapItem.campo);
+    if (extraction.valor_normalizado != null && extraction.valor_normalizado !== "") group.values.push(extraction.valor_normalizado);
   }
 
-  const targetRowNumber = FIRST_DATA_ROW;
-  const targetRow = parseOdsCells(rows[targetRowNumber - 1].xml);
-  const newRowXml = writeOdsDataRow(targetRow, rowData, columns, targetRowNumber, log);
-  const targetRowInfo = rows[targetRowNumber - 1];
-  const newContentXml =
-    contentXml.slice(0, targetRowInfo.index) + newRowXml + contentXml.slice(targetRowInfo.index + targetRowInfo.xml.length);
+  for (const [cellAddress, group] of writeGroups.entries()) {
+    const columnNumber = group.column.split("").reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0);
+    const previousCellXml = odsCellAt(generatedRowXml, columnNumber);
+    const uniqueValues = [...new Set(group.values.map((value) => String(value).trim()).filter(Boolean))];
+    let value = uniqueValues.join(" ");
+    if (group.validation === "amount") value = Number(String(uniqueValues[0] || "").replace(/[^\d.-]/g, ""));
+    mapping[cellAddress] = { cell: cellAddress, fields: group.fields, valueAttempted: value, worksheet: allowedFieldsMapping.worksheet, status: "pendiente" };
+    if (/\btable:formula=/.test(previousCellXml)) {
+      mapping[cellAddress].status = "omitido_formula_existente";
+      log.push({ phase: "write_ods_allowed", cell: cellAddress, fields: group.fields, status: "omitido_formula_existente", value });
+      continue;
+    }
+    if (value == null || value === "" || (typeof value === "number" && Number.isNaN(value))) {
+      mapping[cellAddress].status = "omitido_valor_nulo";
+      log.push({ phase: "write_ods_allowed", cell: cellAddress, fields: group.fields, status: "omitido_valor_nulo", value: null });
+      continue;
+    }
+    const previous = odsCellText(previousCellXml);
+    generatedRowXml = replaceOdsCell(generatedRowXml, columnNumber, (cellXml) => buildOdsCellXml(cellXml, value, group.validation));
+    mapping[cellAddress].status = "escrito";
+    mapping[cellAddress].previous = previous;
+    mapping[cellAddress].valueWritten = value;
+    log.push({ phase: "write_ods_allowed", cell: cellAddress, fields: group.fields, status: "escrito", value, previous });
+  }
 
-  zip.file("content.xml", newContentXml);
-  const outBuffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-  fs.writeFileSync(outPath, outBuffer);
-  return outPath;
+  const generatedTableXml = table.xml.slice(0, row.start) + generatedRowXml + table.xml.slice(row.start + row.xml.length);
+  const generatedXml = originalXml.slice(0, table.start) + generatedTableXml + originalXml.slice(table.start + table.xml.length);
+  fs.writeFileSync(generatedXmlPath, generatedXml, "utf8");
+  const report = odsXmlValidationReport(originalXml, generatedXml);
+  fs.writeFileSync(validationReportPath, formatOdsValidationReport(report), "utf8");
+  if (!report.generatedContentXml.ok) {
+    throw new Error(`ODS abortado: content.xml invalido en linea ${report.generatedContentXml.line}, columna ${report.generatedContentXml.column}: ${report.generatedContentXml.message}`);
+  }
+  if (!report.formulasPreserved || !report.numeroaletrasPreserved) {
+    throw new Error("ODS abortado: las formulas originales, incluida NUMEROALETRAS, no fueron preservadas.");
+  }
+
+  archive.file("content.xml", generatedXml, { compression: "DEFLATE" });
+  const mimetype = await archive.file("mimetype").async("string");
+  archive.file("mimetype", mimetype, { compression: "STORE" });
+  const outputBuffer = await archive.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 }, mimeType: "application/vnd.oasis.opendocument.spreadsheet" });
+  const temporaryPath = `${outPath}.tmp`;
+  fs.writeFileSync(temporaryPath, outputBuffer);
+  const generatedArchive = await loadOdsContent(temporaryPath);
+  const archiveValidation = validateXml(generatedArchive.contentXml);
+  if (!archiveValidation.ok) {
+    fs.rmSync(temporaryPath, { force: true });
+    throw new Error(`ODS abortado: content.xml empaquetado invalido en linea ${archiveValidation.line}, columna ${archiveValidation.column}: ${archiveValidation.message}`);
+  }
+  fs.renameSync(temporaryPath, outPath);
+  log.push({ phase: "write_ods_validation", status: "ok", value: validationReportPath, formulas: report.generatedFormulaCount, numeroaletras: report.numeroaletrasPreserved });
+  return { path: outPath, fixedMapping: mapping, validationReport: report, xmlDebugDir };
+}
+
+async function writeXlsxWorkbook(templatePath, outPath, log, fullExtraction, allowedFieldsMapping) {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(templatePath);
+  const worksheet = workbook.worksheets[0];
+  if (!worksheet) throw new Error("XLSX invalido: no contiene hojas.");
+
+  const mapping = {};
+  log.push({ phase: "write_xlsx_template", status: "hoja_detectada", value: worksheet.name, template: templatePath });
+
+  const writeGroups = new Map();
+  for (const mapItem of allowedFieldsMapping.fields || []) {
+    if (mapItem.tipo !== "automatico" || !mapItem.celda_destino) continue;
+    const extraction = fullExtraction.fields?.[mapItem.campo];
+    if (!extraction || !["validado", "revisar"].includes(extraction.estado)) continue;
+    if (!writeGroups.has(mapItem.celda_destino)) {
+      writeGroups.set(mapItem.celda_destino, { fields: [], values: [], validation: mapItem.validation });
+    }
+    const group = writeGroups.get(mapItem.celda_destino);
+    group.fields.push(mapItem.campo);
+    if (extraction.valor_normalizado != null && extraction.valor_normalizado !== "") {
+      group.values.push(extraction.valor_normalizado);
+    }
+  }
+
+  for (const [cellAddress, group] of writeGroups.entries()) {
+    const cell = worksheet.getCell(cellAddress);
+    const uniqueValues = [...new Set(group.values.map((value) => String(value).trim()).filter(Boolean))];
+    let value = uniqueValues.join(" ");
+    if (group.validation === "amount") value = Number(String(uniqueValues[0] || "").replace(/[^\d.-]/g, ""));
+    mapping[cellAddress] = {
+      cell: cellAddress,
+      fields: group.fields,
+      valueAttempted: value,
+      worksheet: worksheet.name,
+      status: "pendiente",
+    };
+
+    if (cellHasFormula(cell)) {
+      mapping[cellAddress].status = "omitido_formula_existente";
+      log.push({ phase: "write_xlsx_allowed", cell: cellAddress, fields: group.fields, status: "omitido_formula_existente", value });
+      continue;
+    }
+
+    if (value == null || value === "" || (typeof value === "number" && Number.isNaN(value))) {
+      mapping[cellAddress].status = "omitido_valor_nulo";
+      log.push({ phase: "write_xlsx_allowed", cell: cellAddress, fields: group.fields, status: "omitido_valor_nulo", value: null });
+      continue;
+    }
+
+    const previous = excelCellText(cell);
+    cell.value = value;
+    mapping[cellAddress].status = "escrito";
+    mapping[cellAddress].previous = previous;
+    mapping[cellAddress].valueWritten = value;
+    log.push({ phase: "write_xlsx_allowed", cell: cellAddress, fields: group.fields, status: "escrito", value, previous });
+  }
+
+  await workbook.xlsx.writeFile(outPath);
+  return { path: outPath, fixedMapping: mapping };
 }
 
 function summarizeFields(detectedFields) {
@@ -1336,7 +1946,121 @@ function summarizeFields(detectedFields) {
   return { found, doubtful, missing };
 }
 
-async function processFile(filePath) {
+function detectedFieldCandidate(detectedFields, aliases) {
+  for (const alias of aliases || []) {
+    const data = detectedFields[alias];
+    if (data?.value != null && data.value !== "") return data;
+  }
+  return null;
+}
+
+function isClearFormBoilerplate(value) {
+  const text = normalizeHeaderKey(value);
+  if (!text) return true;
+  if (text === "[OBJECT OBJECT]") return true;
+  if (/^(NO|SI|S\/N|N\/A|NULL)$/.test(text)) return true;
+  return ["SOLICITUD TIPO", "FORMULARIO 08", "REGISTRO NACIONAL", "DIRECCION NACIONAL", "CERTIFICACION DE FIRMAS", "NO PONER"].some((marker) => text.includes(marker));
+}
+
+function normalizeFlexibleValue(value, validation) {
+  const raw = String(value || "").replace(/\s+/g, " ").trim();
+  if (isNullLikeValue(raw) || isClearFormBoilerplate(raw)) return { value: null, valid: false, reasonable: false, reason: "basura_o_texto_fijo" };
+  if (validation === "cuit") {
+    const normalized = cleanCuit(raw);
+    return { value: normalized || raw, valid: Boolean(normalized), reasonable: /\d/.test(raw) && raw.replace(/\D/g, "").length >= 8, reason: normalized ? null : "cuit_no_validado" };
+  }
+  if (validation === "domain") {
+    const normalized = cleanDomain(raw);
+    return { value: normalized || raw.toUpperCase(), valid: Boolean(normalized), reasonable: /^[A-Z0-9 -]{5,12}$/i.test(raw), reason: normalized ? null : "dominio_no_validado" };
+  }
+  if (validation === "email") {
+    const normalized = cleanEmail(raw);
+    return { value: normalized || raw, valid: Boolean(normalized), reasonable: raw.includes("@"), reason: normalized ? null : "email_no_validado" };
+  }
+  if (validation === "date") {
+    const normalized = formatDateDdMmYy(raw);
+    return { value: normalized || raw, valid: Boolean(normalized), reasonable: /\d{1,2}|ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|SETIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE/i.test(raw), reason: normalized ? null : "fecha_no_validada" };
+  }
+  if (validation === "amount") {
+    const numericText = raw.replace(/[^\d,.-]/g, "");
+    const normalized = numericText.includes(",") ? numericText.replace(/\./g, "").replace(",", ".") : numericText.replace(/\./g, "");
+    const valid = /^\d+(?:\.\d+)?$/.test(normalized);
+    return { value: valid ? Number(normalized) : raw, valid, reasonable: /\d/.test(raw), reason: valid ? null : "monto_no_validado" };
+  }
+  if (validation === "year") {
+    const match = raw.match(/\b(19|20)\d{2}\b/);
+    return { value: match ? match[0] : raw, valid: Boolean(match), reasonable: /\d{2,4}/.test(raw), reason: match ? null : "anio_no_validado" };
+  }
+  return { value: raw, valid: raw.length >= 2, reasonable: raw.length >= 2, reason: raw.length >= 2 ? null : "texto_insuficiente" };
+}
+
+function buildFullExtraction(detectedFields, diagnostic, allowedFieldsMapping) {
+  const fields = {};
+  const parsed = diagnostic?.visionStructured || null;
+  const parseError = diagnostic?.visionParseError || null;
+  const basicText = String(diagnostic?.visionBasicRawResponse || "").trim();
+
+  for (const fieldName of AUTOMATIC_FIELD_ORDER) {
+    const config = AUTOMATIC_FIELD_CONFIG[fieldName];
+    const mapItem = (allowedFieldsMapping.fields || []).find((item) => item.campo === fieldName) || {};
+    const vision = diagnostic?.visionStructured ? visionFieldCandidate(diagnostic.visionStructured, config.aliases || [fieldName]) : null;
+    const fallback = detectedFieldCandidate(detectedFields, config.aliases || []);
+    const data = vision || fallback;
+    const rawValue = data?.value ?? null;
+    const confidence = data?.confidence || "baja_confianza";
+    const normalized = rawValue == null ? { value: null, valid: false, reasonable: false, reason: "valor_vacio" } : normalizeFlexibleValue(rawValue, config.validation);
+    const reasons = [];
+    let estado = "vacío";
+
+    if (!parsed) reasons.push(parseError ? "parseo_fallido" : "json_vision_ausente");
+    if (rawValue == null || rawValue === "") reasons.push("valor_vacio");
+    if (rawValue != null && normalized.valid && confidence === "alta") estado = "validado";
+    else if (rawValue != null && normalized.valid) estado = "revisar";
+    else if (rawValue != null && normalized.reason !== "basura_o_texto_fijo" && normalized.reasonable) estado = "revisar";
+    else if (rawValue != null) estado = "rechazado";
+    if (normalized.reason) reasons.push(normalized.reason);
+    if (confidence !== "alta" && rawValue != null && ["validado", "revisar"].includes(estado)) reasons.push(`confianza_${confidence}`);
+    if (mapItem.tipo !== "automatico" && rawValue != null) reasons.push(`no_escritura_tipo_${mapItem.tipo || "sin_mapeo"}`);
+
+    fields[fieldName] = {
+      valor_vision_original: rawValue,
+      valor_normalizado: ["validado", "revisar"].includes(estado) ? normalized.value : null,
+      confianza: confidence,
+      observacion: data?.evidence || data?.notes || null,
+      estado,
+      motivo: reasons.length ? reasons : null,
+      celda_destino: mapItem.celda_destino || null,
+      encabezado_excel: mapItem.encabezado_excel || null,
+      tipo: mapItem.tipo || "sin_mapeo",
+      escribible: mapItem.tipo === "automatico" && ["validado", "revisar"].includes(estado),
+      fuente: vision ? "vision" : fallback ? "fallback_texto" : null,
+    };
+  }
+
+  return {
+    ok: Object.values(fields).some((item) => ["validado", "revisar"].includes(item.estado)),
+    basicVision: {
+      empty: !basicText,
+      chars: basicText.length,
+      preview: basicText.slice(0, 1000),
+    },
+    parse: {
+      ok: Boolean(parsed) && !parseError,
+      error: parseError,
+    },
+    fields,
+    summary: {
+      detected: Object.values(fields).filter((item) => item.valor_vision_original != null && item.valor_vision_original !== "").length,
+      validado: Object.values(fields).filter((item) => item.estado === "validado").length,
+      revisar: Object.values(fields).filter((item) => item.estado === "revisar").length,
+      vacio: Object.values(fields).filter((item) => item.estado === "vacío").length,
+      rechazado: Object.values(fields).filter((item) => item.estado === "rechazado").length,
+      escribible: Object.values(fields).filter((item) => item.escribible).length,
+    },
+  };
+}
+
+async function processFile(filePath, allowedFieldsMapping) {
   const fileName = path.basename(filePath);
   const log = [{ phase: "file", status: "inicio", file: fileName, value: filePath }];
   const { text, method, diagnostic, blocks } = await acquireText(filePath, log);
@@ -1348,11 +2072,11 @@ async function processFile(filePath) {
   const debug = extraction.debug;
   applyVisionStructuredFields(detectedFields, diagnostic?.visionStructured, debug);
   const candidates = collectUnvalidatedCandidates(text);
-  const { output, confidence } = buildTemplateOutput(detectedFields);
   const summary = summarizeFields(detectedFields);
-  const mapping = JSON.parse(fs.readFileSync(MAPPING_PATH, "utf8"));
+  const fullExtraction = buildFullExtraction(detectedFields, diagnostic, allowedFieldsMapping);
+  const validationReport = fullExtraction;
   const diagnosis = stats.useful
-    ? "OCR recupero texto suficiente. Si el ODS queda vacio, revisar field_mapping/extractores."
+    ? "Vision recupero datos. Si el XLSX queda vacio, revisar allowed_fields_mapping/readback."
     : "OCR no recupero texto suficiente del manuscrito. El problema esta en preprocessing/OCR antes del mapeo.";
 
   log.push({ phase: "fields_found", status: "ok", value: summary.found });
@@ -1364,6 +2088,7 @@ async function processFile(filePath) {
 
   return {
     sourceFile: fileName,
+    sourcePath: filePath,
     processedAt: new Date().toISOString(),
     documentType: "Formulario 08 manuscrito",
     extractionMode: method,
@@ -1373,8 +2098,8 @@ async function processFile(filePath) {
     ocrBlocks: blocks,
     extractorDiagnosis: diagnosis,
     detectedFields,
-    templateOutput: output,
-    templateConfidence: confidence,
+    fullExtraction,
+    validationReport,
     auxiliaryFields: {
       localidad: detectedFields.localidad,
       provincia: detectedFields.provincia,
@@ -1382,7 +2107,7 @@ async function processFile(filePath) {
       telefono: detectedFields.telefono,
       observacionesRelevantes: detectedFields.observacionesRelevantes,
     },
-    mappingVersion: mapping.version,
+    allowedFieldsMapping,
     summary,
     debug,
     candidates,
@@ -1394,9 +2119,19 @@ async function processFile(filePath) {
 
 async function main() {
   ensureDirs();
+  ensureOpenAiEnvFiles();
+  if (!hasConfiguredOpenAiApiKey()) {
+    console.error(VISION_API_KEY_MESSAGE);
+    return;
+  }
+  console.log("OPENAI_API_KEY detectada");
   moveExistingAuxiliaryOutputFiles();
   const allLogs = [];
   const templatePath = findTemplate();
+  console.log(`Template oficial utilizado: ${path.relative(PROJECT_ROOT, templatePath)}`);
+  allLogs.push({ file: null, phase: "template", status: "oficial_utilizado", value: path.relative(PROJECT_ROOT, templatePath), absolutePath: templatePath });
+  const allowedFieldsMapping = await writeAllowedFieldsMappingDebug(templatePath);
+  allLogs.push({ file: null, phase: "template", status: "allowed_fields_mapping_escrito", value: ALLOWED_FIELDS_MAPPING_DEBUG_PATH, worksheet: allowedFieldsMapping.worksheet });
   const files = fs
     .readdirSync(INPUT_DIR)
     .filter((name) => SUPPORTED_EXTENSIONS.has(path.extname(name).toLowerCase()))
@@ -1412,13 +2147,14 @@ async function main() {
   for (const filePath of files) {
     const fileName = path.basename(filePath);
     try {
-      const result = await processFile(filePath);
+      const result = await processFile(filePath, allowedFieldsMapping);
       const baseName = path.basename(fileName, path.extname(fileName)).replace(/[^A-Z0-9_-]+/gi, "_");
       const stamp = nowStamp();
       const debugRunDir = path.join(DEBUG_DIR, `${baseName}_manuscrito_${stamp}`);
       fs.mkdirSync(debugRunDir, { recursive: true });
       const jsonPath = path.join(debugRunDir, `${baseName}_manuscrito_${stamp}.json`);
       const odsPath = path.join(OUTPUT_DIR, `${baseName}_manuscrito_${stamp}.ods`);
+      const xlsxPath = path.join(OUTPUT_DIR, `${baseName}_manuscrito_${stamp}.xlsx`);
       const rawOcrPath = path.join(debugRunDir, `${baseName}_manuscrito_raw_ocr.txt`);
       const originalDebugPath = path.join(debugRunDir, `${baseName}_manuscrito_${stamp}_original${path.extname(fileName).toLowerCase()}`);
       const preprocessedDebugPath = path.join(debugRunDir, `${baseName}_manuscrito_${stamp}_preprocessed.png`);
@@ -1428,15 +2164,36 @@ async function main() {
       copyDebugFile(filePath, originalDebugPath, result.log, "imagen_original");
       copyDebugFile(result.ocrDiagnostic?.bestImagePath || filePath, preprocessedDebugPath, result.log, "imagen_preprocesada_final");
       fs.writeFileSync(blocksPath, JSON.stringify({ sourceFile: fileName, blocks: result.ocrBlocks || [] }, null, 2), "utf8");
-      const mappedValues = Object.values(result.templateOutput || {}).filter((value) => value != null && value !== "");
+      fs.writeFileSync(path.join(debugRunDir, "allowed_fields_mapping.json"), JSON.stringify(allowedFieldsMapping, null, 2), "utf8");
+      const writeableFields = Object.values(result.fullExtraction?.fields || {}).filter((item) => item.escribible);
       const candidateCount = Object.values(result.candidates || {}).reduce((total, value) => total + (Array.isArray(value) ? value.length : 0), 0);
       const ocrFailed = result.ocrStats.chars < OCR_HARD_FAIL_CHARS;
-      const hasUsefulDetectedData = mappedValues.length > 0 || candidateCount > 0;
-      const shouldWriteOds = !ocrFailed && hasUsefulDetectedData && mappedValues.length > 0;
+      const hasUsefulDetectedData = result.fullExtraction?.summary?.detected > 0 || candidateCount > 0;
+      const shouldWriteOds = !ocrFailed && hasUsefulDetectedData && writeableFields.length > 0;
       const configurationError = result.ocrDiagnostic?.configurationError || null;
+      result.fullMapping = {
+        template: templatePath,
+        worksheet: allowedFieldsMapping.worksheet,
+        allowedFieldsMapping: allowedFieldsMapping.fields,
+        fields: result.fullExtraction?.fields || {},
+      };
+      result.outputMapping = Object.fromEntries(
+        Object.entries(result.fullExtraction?.fields || {}).map(([fieldName, item]) => [
+          fieldName,
+          {
+            cell: item.celda_destino,
+            header: item.encabezado_excel,
+            type: item.tipo,
+            valueAttempted: item.valor_normalizado,
+            confidence: item.confianza,
+            status: shouldWriteOds && item.escribible ? "pendiente_escritura_ods" : "no_escritura",
+            reason: item.escribible ? null : item.motivo,
+          },
+        ])
+      );
       result.extractionStatus = {
         ok: shouldWriteOds,
-        message: shouldWriteOds ? "Datos suficientes detectados para generar ODS parcial." : OCR_FAILURE_MESSAGE,
+        message: shouldWriteOds ? "Datos suficientes detectados para generar ODS editable parcial." : OCR_FAILURE_MESSAGE,
         reason: configurationError
           ? configurationError
           : ocrFailed
@@ -1451,14 +2208,22 @@ async function main() {
       };
       result.outputFiles = {
         json: jsonPath,
+        xlsx: EXPERIMENTAL_XLSX_ENABLED && shouldWriteOds ? xlsxPath : null,
         ods: shouldWriteOds ? odsPath : null,
         rawOcr: rawOcrPath,
         originalImage: originalDebugPath,
         preprocessedImage: preprocessedDebugPath,
         ocrBlocks: blocksPath,
         diagnostic: diagnosticPath,
+        allowedFieldsMapping: ALLOWED_FIELDS_MAPPING_DEBUG_PATH,
+        fullExtraction: path.join(debugRunDir, "full_extraction.json"),
+        fullMapping: path.join(debugRunDir, "full_mapping.json"),
+        readbackOds: READBACK_ODS_DEBUG_PATH,
+        readbackXlsx: EXPERIMENTAL_XLSX_ENABLED ? READBACK_XLSX_DEBUG_PATH : null,
+        debugArtifacts: null,
         debugDir: debugRunDir,
       };
+      result.outputFiles.debugArtifacts = await writeDebugArtifacts(debugRunDir, result, result.log);
       fs.writeFileSync(
         diagnosticPath,
         JSON.stringify(
@@ -1470,6 +2235,10 @@ async function main() {
             ocrDiagnostic: result.ocrDiagnostic,
             summary: result.summary,
             candidates: result.candidates,
+            fullExtraction: result.fullExtraction,
+            validationReport: result.validationReport,
+            fullMapping: result.fullMapping,
+            outputMapping: result.outputMapping,
             outputFiles: result.outputFiles,
           },
           null,
@@ -1495,11 +2264,32 @@ async function main() {
         continue;
       }
 
-      const odsRowData = { __source: fileName, ...result.templateOutput };
       const odsLog = [];
-      await writeOdsWorkbook(templatePath, odsRowData, odsPath, odsLog);
+      const odsResult = await writeOdsWorkbook(templatePath, odsPath, debugRunDir, odsLog, result.fullExtraction, allowedFieldsMapping);
+      const writtenCells = Object.values(odsResult.fixedMapping || {}).filter((item) => item.status === "escrito").map((item) => item.cell);
+      const odsReadback = await readBackOdsCells(odsPath, allowedFieldsMapping.worksheet, writtenCells);
+      fs.writeFileSync(READBACK_ODS_DEBUG_PATH, JSON.stringify(odsReadback, null, 2), "utf8");
+      fs.writeFileSync(path.join(debugRunDir, "readback_ods.json"), JSON.stringify(odsReadback, null, 2), "utf8");
+      result.odsReadback = odsReadback;
+      result.odsXmlValidation = odsResult.validationReport;
+      result.outputMapping = odsResult.fixedMapping || result.outputMapping;
+      result.fullMapping = { ...result.fullMapping, writeResult: result.outputMapping };
+      result.outputFiles.debugArtifacts = await writeDebugArtifacts(debugRunDir, result, result.log);
       result.log.push({ phase: "output", status: "ods_escrito", value: odsPath });
+      result.log.push({ phase: "output", status: "ods_readback_escrito", value: READBACK_ODS_DEBUG_PATH, worksheet: odsReadback.worksheet });
       result.log.push(...odsLog);
+      if (EXPERIMENTAL_XLSX_ENABLED) {
+        if (!fs.existsSync(TEMPLATE_XLSX_PATH)) throw new Error(`No existe el template XLSX experimental: ${TEMPLATE_XLSX_PATH}`);
+        const xlsxLog = [];
+        const xlsxResult = await writeXlsxWorkbook(TEMPLATE_XLSX_PATH, xlsxPath, xlsxLog, result.fullExtraction, allowedFieldsMapping);
+        const xlsxWrittenCells = Object.values(xlsxResult.fixedMapping || {}).filter((item) => item.status === "escrito").map((item) => item.cell);
+        const xlsxReadback = await readBackXlsxCells(xlsxPath, xlsxWrittenCells);
+        fs.writeFileSync(READBACK_XLSX_DEBUG_PATH, JSON.stringify(xlsxReadback, null, 2), "utf8");
+        fs.writeFileSync(path.join(debugRunDir, "readback_xlsx.json"), JSON.stringify(xlsxReadback, null, 2), "utf8");
+        result.xlsxReadback = xlsxReadback;
+        result.log.push({ phase: "output", status: "xlsx_experimental_escrito", value: xlsxPath });
+        result.log.push(...xlsxLog);
+      }
       fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2), "utf8");
       if (result.ocrDiagnostic?.workDir) {
         fs.rmSync(result.ocrDiagnostic.workDir, { recursive: true, force: true });
@@ -1508,10 +2298,12 @@ async function main() {
       allLogs.push({ file: fileName, phase: "output", status: "json_escrito", value: jsonPath });
       processed += 1;
       console.log(`${fileName}: ODS generado ${odsPath}`);
+      if (EXPERIMENTAL_XLSX_ENABLED) console.log(`${fileName}: XLSX experimental generado ${xlsxPath}`);
       console.log(`${fileName}: Debug generado ${debugRunDir}`);
     } catch (error) {
       allLogs.push({ file: fileName, phase: "processing", status: "error", value: error.message });
       console.warn(`${fileName}: no se pudo procesar (${error.message})`);
+      failed += 1;
     }
   }
 

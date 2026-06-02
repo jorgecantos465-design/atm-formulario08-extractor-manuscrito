@@ -2,7 +2,15 @@
 
 ## Objetivo del proyecto
 
-Extractor asistido para imagenes o PDFs escaneados/manuscritos de Formulario 08. Produce JSON compatible con el template final, incluyendo confianza, evidencia y campos para revision humana.
+Extractor asistido exclusivo para imagenes o PDFs escaneados/manuscritos de Formulario 08. Produce JSON compatible con el template final, incluyendo confianza, evidencia y campos para revision humana.
+
+## Limite arquitectonico obligatorio
+
+- Este repositorio procesa solo formularios manuscritos o escaneados.
+- Vision esta permitido cuando mejora la lectura de documentos manuscritos.
+- Los servicios de IA paga estan permitidos en este repositorio.
+- OCR clasico, texto embebido y Vision pueden convivir como estrategias de lectura.
+- Los Formularios 08 digitales pertenecen a `atm-formulario08-extractor`.
 
 ## Stack tecnico detectado
 
@@ -11,6 +19,7 @@ Extractor asistido para imagenes o PDFs escaneados/manuscritos de Formulario 08.
 - `pdf-parse` para PDFs con texto embebido
 - `jszip` para manejo de archivos comprimidos/plantillas
 - Dependencias externas opcionales: `tesseract` con idioma `spa`, `pdftoppm` o `magick`
+- OpenAI Vision permitido para lectura asistida cuando este configurado
 - Salida JSON y logs JSONL
 
 ## Comandos
@@ -40,6 +49,7 @@ Extractor asistido para imagenes o PDFs escaneados/manuscritos de Formulario 08.
 - No inventar datos ante baja legibilidad: usar `null`, confianza `baja` y notas.
 - Mantener salida compatible con `templateOutput` y `field-mapping.json`.
 - Cualquier dependencia externa de OCR debe documentarse y no asumirse instalada.
+- No incorporar el flujo deterministico de PDFs digitales como segundo producto dentro de este repositorio.
 
 ## No tocar sin autorizacion
 

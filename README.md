@@ -4,6 +4,24 @@ Extractor asistido para imagenes o PDFs escaneados del Formulario 08 manuscrito.
 
 Este proyecto esta separado del extractor `atm-formulario08-extractor` porque los documentos manuscritos requieren otra estrategia: OCR, tolerancia a baja legibilidad, trazabilidad y revision humana posterior.
 
+## Alcance arquitectonico
+
+Este repositorio procesa exclusivamente formularios manuscritos o escaneados.
+
+Pipeline permitido:
+
+```text
+imagen o PDF escaneado -> texto embebido / OCR clasico / Vision -> deteccion -> confianza -> mapeo -> salida
+```
+
+Reglas obligatorias:
+
+- Vision esta permitido.
+- Los servicios de IA paga estan permitidos.
+- OCR clasico y herramientas de renderizado pueden utilizarse como fallback.
+- Los PDFs digitales deben procesarse en `atm-formulario08-extractor`.
+- No trasladar logica manuscrita al extractor digital.
+
 ## Estructura
 
 ```text
@@ -19,6 +37,28 @@ atm-formulario08-extractor-manuscrito/
 
 ```bash
 npm install
+```
+
+## Configuración OpenAI
+
+1. Ir a:
+   https://platform.openai.com/settings/organization/api-keys
+
+2. Crear una API Key nueva.
+
+3. Crear un archivo:
+   `.env`
+
+4. Pegar:
+
+```bash
+OPENAI_API_KEY=tu_api_key
+```
+
+5. Ejecutar:
+
+```bash
+npm run extractor
 ```
 
 Para OCR real de imagenes o PDFs escaneados, instalar herramientas externas y dejarlas disponibles en el `PATH`:
@@ -45,9 +85,26 @@ npm run extract-manuscrito
 
 ## Resultado
 
-Por cada archivo de `input/`, se genera un JSON en `output/`.
+Por cada archivo de `input/`, se genera un ODS editable en `output/` a partir de
+`templates/Modelo Resolucion General.ods`.
 
-El JSON incluye:
+La escritura modifica unicamente las celdas automaticas permitidas. Conserva las
+formulas y funciones de LibreOffice del template, incluida `=numeroaletras(...)`.
+Antes de guardar valida `content.xml` y genera en `debug/<ejecucion>/xml/`:
+
+- `original_content.xml`
+- `generated_content.xml`
+- `xml_validation_report.txt`
+
+Si el XML generado no es valido, no entrega un ODS corrupto.
+
+La salida XLSX se mantiene solo para pruebas experimentales:
+
+```bash
+npm run extractor:xlsx
+```
+
+El JSON de depuracion incluye:
 
 - `detectedFields`: campos humanos detectados con `value`, `confidence`, `evidence` y `notes`.
 - `templateOutput`: salida normalizada con placeholders compatibles con el template actual.

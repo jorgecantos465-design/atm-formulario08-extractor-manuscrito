@@ -3,7 +3,9 @@ input/
 logs/
 output/
 debug/
-.env*
+.env
+.env.local
+!.env.example
 *.pdf
 *.png
 *.jpg

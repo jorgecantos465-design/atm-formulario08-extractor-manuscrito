@@ -1,12 +1,13 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { pathToFileURL } = require("url");
 const { execFileSync } = require("child_process");
 const ExcelJS = require("exceljs");
 const JSZip = require("jszip");
 const { SaxesParser } = require("saxes");
 const dotenv = require("dotenv");
-const { createCanvas, DOMMatrix, DOMPoint, DOMRect, ImageData, Path2D } = require("@napi-rs/canvas");
+const { createCanvas, loadImage, DOMMatrix, DOMPoint, DOMRect, ImageData, Path2D } = require("@napi-rs/canvas");
 dotenv.config({ quiet: true });
 
 let pdfParse = null;
@@ -19,6 +20,7 @@ try {
 let pdfJsModulePromise = null;
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
+const PDFJS_WASM_URL = pathToFileURL(path.join(PROJECT_ROOT, "node_modules", "pdfjs-dist", "wasm") + path.sep).href;
 const INPUT_DIR = path.join(PROJECT_ROOT, "input");
 const OUTPUT_DIR = path.join(PROJECT_ROOT, "output");
 const DEBUG_DIR = path.join(PROJECT_ROOT, "debug");
@@ -28,7 +30,10 @@ const EASYOCR_PROBE_PATH = path.join(__dirname, "easyocr_probe.py");
 const ENV_EXAMPLE_PATH = path.join(PROJECT_ROOT, ".env.example");
 const ENV_PATH = path.join(PROJECT_ROOT, ".env");
 const TEMPLATE_ODS_PATH = path.join(TEMPLATE_DIR, "Modelo Resolucion General.ods");
-const TEMPLATE_XLSX_PATH = path.join(TEMPLATE_DIR, "Modelo Resolucion General.xlsx");
+const VISION_CACHE_PATH = path.join(DEBUG_DIR, "full_vision_response.json");
+const FULL_EXTRACTION_DEBUG_PATH = path.join(DEBUG_DIR, "full_extraction.json");
+const FULL_MAPPING_DEBUG_PATH = path.join(DEBUG_DIR, "full_mapping.json");
+const VALIDATION_REPORT_DEBUG_PATH = path.join(DEBUG_DIR, "validation_report.json");
 const READBACK_XLSX_DEBUG_PATH = path.join(DEBUG_DIR, "readback_xlsx.json");
 const READBACK_ODS_DEBUG_PATH = path.join(DEBUG_DIR, "readback_ods.json");
 const ALLOWED_FIELDS_MAPPING_DEBUG_PATH = path.join(DEBUG_DIR, "allowed_fields_mapping.json");
@@ -39,13 +44,17 @@ const OCR_MIN_CHARS = 50;
 const OCR_MIN_WORDS = 8;
 const OCR_HARD_FAIL_CHARS = 50;
 const VISION_MIN_IMAGE_BYTES = 1024;
+const VISION_MIN_NON_WHITE_PIXELS = 5000;
+const VISION_MIN_NON_WHITE_RATIO = 0.0005;
 const OCR_MODE = String(process.env.MANUSCRITO_OCR_MODE || "openai_vision").toLowerCase();
 const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini";
 const EASY_OCR_ENABLED = process.argv.includes("--easyocr") || String(process.env.MANUSCRITO_EASYOCR || "").trim() === "1";
 const EXPERIMENTAL_XLSX_ENABLED = process.argv.includes("--experimental-xlsx");
+const USE_VISION_CACHE = process.argv.includes("--use-cache") || String(process.env.USE_VISION_CACHE || "").trim().toLowerCase() === "true";
 const OCR_FAILURE_MESSAGE = "NO SE DETECTARON DATOS SUFICIENTES DEL FORMULARIO";
 const OCR_ENGINE_FAILURE_MESSAGE = "Falla de OCR: el motor actual no puede leer este manuscrito con precision suficiente.";
 const VISION_API_KEY_MESSAGE = "Falta configurar OPENAI_API_KEY en el archivo .env";
+const INPUT_REQUIRED_MESSAGE = 'Debe indicar un archivo de entrada explicito con --input "RUTA_DEL_ARCHIVO_ACTUAL". Abortado sin usar input/ y sin llamar a OpenAI.';
 const BASIC_VISION_PROMPT = "Describi todo lo que ves en esta imagen.";
 const STRUCTURED_VISION_PROMPT = [
   "Lee la imagen completa de un Formulario 08 manuscrito argentino.",
@@ -87,6 +96,23 @@ function getOpenAiApiKey() {
 function hasConfiguredOpenAiApiKey() {
   const apiKey = getOpenAiApiKey();
   return Boolean(apiKey && apiKey !== "pegar_api_key_aqui" && apiKey !== "tu_api_key");
+}
+
+function argValue(name) {
+  const index = process.argv.indexOf(name);
+  if (index === -1) return null;
+  const value = process.argv[index + 1];
+  if (!value || value.startsWith("--")) return null;
+  return value;
+}
+
+function resolveInputPath(inputValue) {
+  if (!inputValue) return null;
+  return path.resolve(path.isAbsolute(inputValue) ? inputValue : path.join(PROJECT_ROOT, inputValue));
+}
+
+function normalizeFilePathForCompare(filePath) {
+  return path.resolve(filePath || "").toLowerCase();
 }
 
 function ensureOpenAiEnvFiles() {
@@ -283,12 +309,99 @@ function imageSizeBytes(filePath) {
   }
 }
 
+async function writeImageAsPng(sourcePath, outPath) {
+  const image = await loadImage(sourcePath);
+  const canvas = createCanvas(image.width, image.height);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(image, 0, 0);
+  fs.writeFileSync(outPath, canvas.toBuffer("image/png"));
+}
+
 function validateVisionImage(imagePath, log) {
   const bytes = imageSizeBytes(imagePath);
   if (bytes >= VISION_MIN_IMAGE_BYTES) return null;
   const message = "Conversión PDF → imagen fallida";
   log.push({ phase: "vision_image", status: "conversion_pdf_imagen_fallida", value: message, bytes });
   return message;
+}
+
+async function analyzeVisualContent(imagePath) {
+  const bytes = imageSizeBytes(imagePath);
+  const base = {
+    imagePath,
+    bytes,
+    width: null,
+    height: null,
+    pixels: 0,
+    nonWhitePixels: 0,
+    nonWhiteRatio: 0,
+    validVisualContent: false,
+    error: null,
+  };
+  if (bytes < VISION_MIN_IMAGE_BYTES) {
+    return { ...base, error: `imagen menor al minimo de bytes (${bytes})` };
+  }
+  try {
+    const image = await loadImage(imagePath);
+    const width = image.width;
+    const height = image.height;
+    const canvas = createCanvas(width, height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(image, 0, 0);
+    const data = ctx.getImageData(0, 0, width, height).data;
+    let nonWhitePixels = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const isWhite = data[i + 3] > 248 && data[i] > 248 && data[i + 1] > 248 && data[i + 2] > 248;
+      if (!isWhite) nonWhitePixels += 1;
+    }
+    const pixels = width * height;
+    const nonWhiteRatio = pixels ? nonWhitePixels / pixels : 0;
+    return {
+      ...base,
+      width,
+      height,
+      pixels,
+      nonWhitePixels,
+      nonWhiteRatio,
+      validVisualContent: nonWhitePixels >= VISION_MIN_NON_WHITE_PIXELS && nonWhiteRatio >= VISION_MIN_NON_WHITE_RATIO,
+    };
+  } catch (error) {
+    return { ...base, error: error.message };
+  }
+}
+
+function writeRenderReport(workDir, report, log) {
+  const reportPath = path.join(workDir, "render_report.json");
+  fs.writeFileSync(reportPath, JSON.stringify(report, null, 2), "utf8");
+  log.push({
+    phase: "render_report",
+    status: report.validVisualContent ? "validVisualContent_true" : "validVisualContent_false",
+    value: reportPath,
+    method: report.method,
+  });
+  return reportPath;
+}
+
+async function validateVisionImageContent(imagePath, log, method = "unknown", workDir = path.dirname(imagePath)) {
+  const visual = await analyzeVisualContent(imagePath);
+  const report = {
+    generatedAt: new Date().toISOString(),
+    method,
+    thresholds: {
+      minBytes: VISION_MIN_IMAGE_BYTES,
+      minNonWhitePixels: VISION_MIN_NON_WHITE_PIXELS,
+      minNonWhiteRatio: VISION_MIN_NON_WHITE_RATIO,
+    },
+    ...visual,
+  };
+  report.reportPath = writeRenderReport(workDir, report, log);
+  if (report.validVisualContent) {
+    log.push({ phase: "vision_image", status: "contenido_visual_valido", value: imagePath, bytes: report.bytes, nonWhitePixels: report.nonWhitePixels });
+    return { ok: true, report };
+  }
+  const message = report.error || "Imagen renderizada sin contenido visual suficiente";
+  log.push({ phase: "vision_image", status: "contenido_visual_invalido", value: message, bytes: report.bytes, nonWhitePixels: report.nonWhitePixels });
+  return { ok: false, error: message, report };
 }
 
 async function loadPdfJs() {
@@ -311,6 +424,7 @@ async function renderPdfFirstPageWithPdfJs(pdfPath, outPath, log) {
       data: new Uint8Array(fs.readFileSync(pdfPath)),
       disableWorker: true,
       useSystemFonts: true,
+      wasmUrl: PDFJS_WASM_URL,
     });
     const pdf = await loadingTask.promise;
     const page = await pdf.getPage(1);
@@ -341,33 +455,37 @@ async function renderFirstPageForVision(filePath, log) {
     if (ext === ".png") {
       fs.copyFileSync(filePath, outPath);
       log.push({ phase: "vision_image", status: "imagen_png_copiada", value: outPath });
-      const imageError = validateVisionImage(outPath, log);
-      if (imageError) return { imagePath: null, workDir, error: imageError };
-      return { imagePath: outPath, workDir, error: null };
+      const validation = await validateVisionImageContent(outPath, log, "input_png", workDir);
+      if (!validation.ok) return { imagePath: null, workDir, error: validation.error, renderReport: validation.report };
+      return { imagePath: outPath, workDir, error: null, renderReport: validation.report };
     }
     if (commandExists("magick")) {
       try {
         execFileSync("magick", [filePath, outPath], { stdio: "ignore" });
         log.push({ phase: "vision_image", status: "imagen_convertida_png", value: outPath });
-        const imageError = validateVisionImage(outPath, log);
-        if (imageError) return { imagePath: null, workDir, error: imageError };
-        return { imagePath: outPath, workDir, error: null };
+        const validation = await validateVisionImageContent(outPath, log, "magick_image", workDir);
+        if (!validation.ok) return { imagePath: null, workDir, error: validation.error, renderReport: validation.report };
+        return { imagePath: outPath, workDir, error: null, renderReport: validation.report };
       } catch (error) {
         log.push({ phase: "vision_image", status: "error_conversion_imagen", value: error.message });
         return { imagePath: null, workDir, error: error.message };
       }
     }
-    fs.copyFileSync(filePath, outPath);
-    log.push({ phase: "vision_image", status: "imagen_copiada_sin_conversion", value: outPath });
-    const imageError = validateVisionImage(outPath, log);
-    if (imageError) return { imagePath: null, workDir, error: imageError };
-    return { imagePath: outPath, workDir, error: null };
+    await writeImageAsPng(filePath, outPath);
+    log.push({ phase: "vision_image", status: "imagen_normalizada_png", value: outPath });
+    const validation = await validateVisionImageContent(outPath, log, "input_image", workDir);
+    if (!validation.ok) return { imagePath: null, workDir, error: validation.error, renderReport: validation.report };
+    return { imagePath: outPath, workDir, error: null, renderReport: validation.report };
   }
 
   const pdfJsImage = await renderPdfFirstPageWithPdfJs(filePath, outPath, log);
   if (pdfJsImage) {
-    log.push({ phase: "vision_image", status: "pdf_pagina_1_renderizada_pdfjs", value: outPath, bytes: imageSizeBytes(outPath) });
-    return { imagePath: outPath, workDir, error: null };
+    const validation = await validateVisionImageContent(outPath, log, "pdfjs", workDir);
+    if (validation.ok) {
+      log.push({ phase: "vision_image", status: "pdf_pagina_1_renderizada_pdfjs", value: outPath, bytes: imageSizeBytes(outPath) });
+      return { imagePath: outPath, workDir, error: null, renderReport: validation.report };
+    }
+    log.push({ phase: "vision_image", status: "pdfjs_contenido_visual_invalido_fallback", value: validation.error, bytes: imageSizeBytes(outPath) });
   }
 
   const pages = renderPdfForOcr(filePath, workDir, log);
@@ -376,9 +494,9 @@ async function renderFirstPageForVision(filePath, log) {
   }
   fs.copyFileSync(pages[0], outPath);
   log.push({ phase: "vision_image", status: "pdf_pagina_1_renderizada", value: outPath });
-  const imageError = validateVisionImage(outPath, log);
-  if (imageError) return { imagePath: null, workDir, error: imageError };
-  return { imagePath: outPath, workDir, error: null };
+  const validation = await validateVisionImageContent(outPath, log, "pdf_external", workDir);
+  if (!validation.ok) return { imagePath: null, workDir, error: validation.error, renderReport: validation.report };
+  return { imagePath: outPath, workDir, error: null, renderReport: validation.report };
 }
 
 async function callOpenAiVision(imagePath, prompt, log, phase) {
@@ -424,6 +542,62 @@ function structuredVisionToText(data) {
   return normalizeText(lines.join("\n"));
 }
 
+function normalizeCachedVisionPayload(rawPayload, sourcePath) {
+  const payload = rawPayload?.visionResponseJson || rawPayload?.responseJson || rawPayload;
+  const rawText = rawPayload?.visionRawResponse || rawPayload?.rawText || responseText(payload) || (typeof payload === "string" ? payload : "");
+  const parsed = rawPayload?.visionStructured || rawPayload?.structured || parseJsonLoose(rawText) || (payload?.detectedFields ? payload : null);
+  const structured = parsed || { rawText, parseError: "No se pudo parsear JSON desde la respuesta cacheada de Vision." };
+  const text = structuredVisionToText(structured) || rawText;
+  const stats = textStats(text);
+  return {
+    text,
+    method: "openai_vision_cache",
+    diagnostic: {
+      bestVariant: "openai_vision_cache",
+      bestImagePath: sourcePath,
+      stats,
+      visionImagePath: sourcePath,
+      visionPrompt: rawPayload?.visionPrompt || STRUCTURED_VISION_PROMPT,
+      visionBasicPrompt: rawPayload?.visionBasicPrompt || BASIC_VISION_PROMPT,
+      visionBasicRawResponse: rawPayload?.visionBasicRawResponse || "",
+      visionBasicResponseJson: rawPayload?.visionBasicResponseJson || null,
+      visionRawResponse: rawText,
+      visionResponseJson: payload && typeof payload === "object" ? payload : null,
+      visionStructured: structured,
+      visionParseError: parsed ? null : structured.parseError,
+      variants: [{ variant: "openai_vision_cache", chars: stats.chars, words: stats.words, useful: stats.useful, blocks: 0, error: null }],
+      cachePath: VISION_CACHE_PATH,
+      usedCache: true,
+    },
+    blocks: [],
+  };
+}
+
+function loadVisionCache(filePath, log) {
+  const cachePath = VISION_CACHE_PATH;
+  if (!fs.existsSync(cachePath)) {
+    throw new Error(`USE_VISION_CACHE activo, pero no existe cache en ${cachePath}. Abortado sin llamar a OpenAI.`);
+  }
+  const raw = fs.readFileSync(cachePath, "utf8");
+  const parsed = parseJsonLoose(raw) || { rawText: raw };
+  const cachedSourcePath = parsed?.sourcePath || parsed?.diagnostic?.sourcePath || null;
+  if (!cachedSourcePath) {
+    throw new Error(`USE_VISION_CACHE activo, pero el cache no declara sourcePath en ${cachePath}. Abortado sin llamar a OpenAI.`);
+  }
+  if (normalizeFilePathForCompare(cachedSourcePath) !== normalizeFilePathForCompare(filePath)) {
+    throw new Error(`USE_VISION_CACHE activo, pero el cache pertenece a otro input. Cache: ${cachedSourcePath}. Input: ${filePath}. Abortado sin llamar a OpenAI.`);
+  }
+  const result = normalizeCachedVisionPayload(parsed, filePath);
+  result.diagnostic.cachePath = cachePath;
+  log.push({ phase: "vision_cache", status: "usado", value: cachePath, chars: result.text.length });
+  return result;
+}
+
+function saveVisionCache(payload, log) {
+  fs.writeFileSync(VISION_CACHE_PATH, JSON.stringify(payload, null, 2), "utf8");
+  log.push({ phase: "vision_cache", status: "escrito", value: VISION_CACHE_PATH });
+}
+
 async function runOpenAiVision(filePath, log) {
   const apiKey = getOpenAiApiKey();
   if (!apiKey) {
@@ -457,6 +631,8 @@ async function runOpenAiVision(filePath, log) {
         bestImagePath: null,
         workDir: rendered.workDir,
         imageError: rendered.error,
+        renderReport: rendered.renderReport || null,
+        visionCallCount: 0,
         stats: textStats(""),
         variants: [{ variant: "openai_vision", chars: 0, words: 0, useful: false, blocks: 0, error: rendered.error }],
       },
@@ -465,13 +641,30 @@ async function runOpenAiVision(filePath, log) {
   }
 
   try {
-    const basic = await callOpenAiVision(rendered.imagePath, BASIC_VISION_PROMPT, log, "vision_basic_test");
     const structuredResponse = await callOpenAiVision(rendered.imagePath, STRUCTURED_VISION_PROMPT, log, "vision_structured");
     const raw = structuredResponse.rawText;
     const parsed = parseJsonLoose(raw);
     const structured = parsed || { rawText: raw, parseError: "No se pudo parsear JSON desde la respuesta de Vision." };
     const text = structuredVisionToText(structured) || raw;
     const stats = textStats(text);
+    saveVisionCache(
+      {
+        cachedAt: new Date().toISOString(),
+        sourcePath: filePath,
+        model: OPENAI_VISION_MODEL,
+        visionPrompt: STRUCTURED_VISION_PROMPT,
+        visionBasicPrompt: BASIC_VISION_PROMPT,
+        visionBasicRawResponse: "",
+        visionBasicResponseJson: null,
+        visionRawResponse: raw,
+        visionResponseJson: structuredResponse.responseJson,
+        visionStructured: structured,
+        visionParseError: parsed ? null : structured.parseError,
+        renderReport: rendered.renderReport || null,
+        visionCallCount: 1,
+      },
+      log
+    );
     log.push({ phase: "vision_ai", status: stats.useful ? "texto_suficiente" : "texto_insuficiente", chars: stats.chars, words: stats.words });
     return {
       text,
@@ -482,10 +675,12 @@ async function runOpenAiVision(filePath, log) {
         workDir: rendered.workDir,
         stats,
         visionImagePath: rendered.imagePath,
+        renderReport: rendered.renderReport || null,
+        visionCallCount: 1,
         visionPrompt: STRUCTURED_VISION_PROMPT,
         visionBasicPrompt: BASIC_VISION_PROMPT,
-        visionBasicRawResponse: basic.rawText,
-        visionBasicResponseJson: basic.responseJson,
+        visionBasicRawResponse: "",
+        visionBasicResponseJson: null,
         visionRawResponse: raw,
         visionResponseJson: structuredResponse.responseJson,
         visionStructured: structured,
@@ -504,6 +699,8 @@ async function runOpenAiVision(filePath, log) {
         bestImagePath: rendered.imagePath,
         workDir: rendered.workDir,
         visionImagePath: rendered.imagePath,
+        renderReport: rendered.renderReport || null,
+        visionCallCount: 1,
         visionPrompt: STRUCTURED_VISION_PROMPT,
         visionBasicPrompt: BASIC_VISION_PROMPT,
         visionBasicRawResponse: null,
@@ -767,6 +964,13 @@ async function acquireText(filePath, log) {
     status: apiKey ? "openai_api_key_detectada" : "openai_api_key_faltante",
     value: apiKey ? "process.env.OPENAI_API_KEY detectada" : VISION_API_KEY_MESSAGE,
   });
+
+  if (USE_VISION_CACHE) {
+    const modeMessage = "Modo usado: cache Vision";
+    console.log(`${path.basename(filePath)}: ${modeMessage}`);
+    log.push({ phase: "mode", status: "openai_vision_cache", value: modeMessage });
+    return loadVisionCache(filePath, log);
+  }
 
   if (apiKey) {
     const modeMessage = "Modo usado: OpenAI Vision";
@@ -1260,7 +1464,7 @@ function extractDetectedFields(text, sourceFile = "") {
 
 function findTemplate() {
   if (fs.existsSync(TEMPLATE_ODS_PATH)) return TEMPLATE_ODS_PATH;
-  throw new Error(`No existe el template oficial requerido: ${TEMPLATE_ODS_PATH}`);
+  throw new Error(`No existe el template ODS requerido: ${TEMPLATE_ODS_PATH}`);
 }
 
 function copyDebugFile(sourcePath, targetPath, log, label) {
@@ -1374,12 +1578,14 @@ async function writeDebugArtifacts(debugRunDir, result, log) {
     inputImage: path.join(debugRunDir, "input_page_1.png"),
     prompt: path.join(debugRunDir, "vision_prompt.txt"),
     rawResponse: path.join(debugRunDir, "vision_raw_response.txt"),
+    fullVisionResponse: path.join(debugRunDir, "full_vision_response.json"),
     parsedJson: path.join(debugRunDir, "vision_parsed.json"),
     validation: path.join(debugRunDir, "validation_report.json"),
     mapping: path.join(debugRunDir, "full_mapping.json"),
     outputMapping: path.join(debugRunDir, "output_mapping.json"),
     fullExtraction: path.join(debugRunDir, "full_extraction.json"),
     allowedFieldsMapping: path.join(debugRunDir, "allowed_fields_mapping.json"),
+    renderReport: path.join(debugRunDir, "render_report.json"),
     basicPrompt: path.join(debugRunDir, "vision_basic_prompt.txt"),
     basicResponse: path.join(debugRunDir, "vision_basic_raw_response.txt"),
     easyOcrRawResponse: path.join(debugRunDir, "easyocr_raw_response.txt"),
@@ -1396,21 +1602,53 @@ async function writeDebugArtifacts(debugRunDir, result, log) {
     diagnostic.visionResponseJson ? JSON.stringify(diagnostic.visionResponseJson) : diagnostic.visionRawResponse || "",
     "utf8"
   );
+  fs.writeFileSync(
+    files.fullVisionResponse,
+    JSON.stringify(
+      {
+        cachedAt: new Date().toISOString(),
+        sourcePath: result.sourcePath,
+        extractionMode: result.extractionMode,
+        usedCache: Boolean(diagnostic.usedCache),
+        cachePath: diagnostic.cachePath || null,
+        visionPrompt: diagnostic.visionPrompt || STRUCTURED_VISION_PROMPT,
+        visionBasicPrompt: diagnostic.visionBasicPrompt || BASIC_VISION_PROMPT,
+        visionBasicRawResponse: diagnostic.visionBasicRawResponse || "",
+        visionBasicResponseJson: diagnostic.visionBasicResponseJson || null,
+        visionRawResponse: diagnostic.visionRawResponse || "",
+        visionResponseJson: diagnostic.visionResponseJson || null,
+        visionStructured: diagnostic.visionStructured || null,
+        visionParseError: diagnostic.visionParseError || null,
+        renderReport: diagnostic.renderReport || null,
+        visionCallCount: diagnostic.visionCallCount || 0,
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
   fs.writeFileSync(files.parsedJson, JSON.stringify(diagnostic.visionStructured || { parseError: diagnostic.visionParseError || "sin_respuesta_parseada" }, null, 2), "utf8");
   fs.writeFileSync(files.validation, JSON.stringify(result.validationReport || {}, null, 2), "utf8");
   fs.writeFileSync(files.mapping, JSON.stringify(result.fullMapping || result.outputMapping || {}, null, 2), "utf8");
   fs.writeFileSync(files.outputMapping, JSON.stringify(result.outputMapping || {}, null, 2), "utf8");
   fs.writeFileSync(files.fullExtraction, JSON.stringify(result.fullExtraction || {}, null, 2), "utf8");
   fs.writeFileSync(files.allowedFieldsMapping, JSON.stringify(result.allowedFieldsMapping || {}, null, 2), "utf8");
+  fs.writeFileSync(files.renderReport, JSON.stringify(diagnostic.renderReport || {}, null, 2), "utf8");
+  fs.copyFileSync(files.fullVisionResponse, VISION_CACHE_PATH);
+  fs.copyFileSync(files.validation, VALIDATION_REPORT_DEBUG_PATH);
+  fs.copyFileSync(files.mapping, FULL_MAPPING_DEBUG_PATH);
+  fs.copyFileSync(files.fullExtraction, FULL_EXTRACTION_DEBUG_PATH);
 
   log.push({ phase: "debug_file", status: "escrito", field: "vision_prompt", value: files.prompt });
   log.push({ phase: "debug_file", status: "escrito", field: "vision_raw_response", value: files.rawResponse });
+  log.push({ phase: "debug_file", status: "escrito", field: "full_vision_response", value: files.fullVisionResponse });
   log.push({ phase: "debug_file", status: "escrito", field: "vision_parsed", value: files.parsedJson });
   log.push({ phase: "debug_file", status: "escrito", field: "validation_report", value: files.validation });
   log.push({ phase: "debug_file", status: "escrito", field: "full_mapping", value: files.mapping });
   log.push({ phase: "debug_file", status: "escrito", field: "output_mapping", value: files.outputMapping });
   log.push({ phase: "debug_file", status: "escrito", field: "full_extraction", value: files.fullExtraction });
   log.push({ phase: "debug_file", status: "escrito", field: "allowed_fields_mapping", value: files.allowedFieldsMapping });
+  log.push({ phase: "debug_file", status: "escrito", field: "render_report", value: files.renderReport });
   log.push({ phase: "debug_file", status: "escrito", field: "vision_basic_prompt", value: files.basicPrompt });
   log.push({ phase: "debug_file", status: "escrito", field: "vision_basic_raw_response", value: files.basicResponse });
   if (EASY_OCR_ENABLED) {
@@ -1436,15 +1674,15 @@ function excelCellText(cell) {
 }
 
 const AUTOMATIC_FIELD_CONFIG = {
-  cuit_adquirente: { headers: ["CUIT ADQUIRENTE"], aliases: ["cuit_adquirente", "cuitCuilCompradorAdquirente"], validation: "cuit" },
-  nombre_adquirente: { headers: ["NOMBRE ADQUIRENTE"], aliases: ["nombre_adquirente", "nombreCompletoCompradorAdquirente"], validation: "text" },
+  cuit_adquirente: { headers: ["CUIT ADQUIRENTE", "CUIT ADQUIRIENTE"], aliases: ["cuit_adquirente", "cuitCuilCompradorAdquirente"], validation: "cuit" },
+  nombre_adquirente: { headers: ["NOMBRE ADQUIRENTE", "NOMBRE ADQUIRIENTE"], aliases: ["nombre_adquirente", "nombreCompletoCompradorAdquirente"], validation: "text" },
   email: { headers: ["EMAIL F 08 APARTADO D"], aliases: ["email", "correoElectronico", "mail"], validation: "email" },
-  cuit_adquirente_f08: { headers: ["CUIT ADQUIRIENTE"], aliases: ["cuit_adquirente_f08", "cuit_adquirente", "cuitCuilCompradorAdquirente"], validation: "cuit" },
-  nombre_adquirente_f08: { headers: ["NOMBRE ADQUIRIENTE"], aliases: ["nombre_adquirente_f08", "nombre_adquirente", "nombreCompletoCompradorAdquirente"], validation: "text" },
+  cuit_adquirente_f08: { headers: ["CUIT ADQUIRIENTE", "CUIT ADQUIRENTE"], aliases: ["cuit_adquirente_f08", "cuit_adquirente", "cuitCuilCompradorAdquirente"], validation: "cuit" },
+  nombre_adquirente_f08: { headers: ["NOMBRE ADQUIRIENTE", "NOMBRE ADQUIRENTE"], aliases: ["nombre_adquirente_f08", "nombre_adquirente", "nombreCompletoCompradorAdquirente"], validation: "text" },
   numero_formulario_08: { headers: ["NRO FORMULARIO 08"], aliases: ["numero_formulario_08", "numeroFormulario", "nroFormulario"], validation: "text" },
   dominio: { headers: ["DOMINIO"], aliases: ["dominio", "patente", "dominioPatente"], validation: "domain" },
   domicilio_adquirente: { headers: ["DOMICILIO ADQUIRIENTE"], aliases: ["domicilio_adquirente", "domicilio", "domicilioComprador"], validation: "text" },
-  lugar_fecha_impresion_osd: { headers: ["LUGARY FECHA DE IMPRESIDN DEL OSD:"], aliases: ["lugar_fecha_impresion_osd", "fecha", "fechaFormulario", "lugarYFecha"], validation: "date" },
+  lugar_fecha_impresion_osd: { headers: ["LUGARY FECHA DE IMPRESIDN DEL OSD:", "LUGARY FECHA DE IMPRESION DEL OSD:", "LUGAR Y FECHA DE IMPRESION DEL OSD"], aliases: ["lugar_fecha_impresion_osd", "fecha", "fechaFormulario", "lugarYFecha"], validation: "date" },
   marca: { headers: ["MARCA, MODELO, TIPO (F.08/TOAD)"], aliases: ["marca", "marcaModelo", "marcaYModelo"], validation: "text", sharedCellGroup: "marca_modelo_tipo" },
   modelo: { headers: ["MARCA, MODELO, TIPO (F.08/TOAD)"], aliases: ["modelo", "marcaModelo", "marcaYModelo"], validation: "text", sharedCellGroup: "marca_modelo_tipo" },
   modelo_anio: { headers: ["MODELO (TAX-AÑO DE FABRICACIÓN)"], aliases: ["modelo_anio", "modeloAnio", "modeloAno"], validation: "text" },
@@ -1476,6 +1714,11 @@ const NON_AUTOMATIC_COLUMNS = [
   { field: "alicuota", headers: ["ALÍCUOTA"], tipo: "formula" },
   { field: "impuesto_determinado", headers: ["IMPUESTO DETERMINADO"], tipo: "fijo_template" },
 ];
+
+const FIXED_FIELD_VALUES = {
+  caracter: "TITULAR",
+  registro: "NRO",
+};
 
 function normalizeHeaderKey(value) {
   return stripAccents(String(value || "")).replace(/\s+/g, " ").trim().toUpperCase();
@@ -1664,7 +1907,68 @@ async function loadOdsContent(templatePath) {
   return { archive, contentXml: await contentEntry.async("string") };
 }
 
-async function buildAllowedFieldsMapping(templatePath) {
+async function buildAllowedFieldsMappingFromXlsx(templatePath) {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(templatePath);
+  const worksheet = workbook.getWorksheet("notificar") || workbook.worksheets[0];
+  if (!worksheet) throw new Error("XLSX invalido: no contiene hojas.");
+  const headerIndex = new Map();
+  const headerRow = worksheet.getRow(1);
+  for (let col = 1; col <= worksheet.columnCount; col += 1) {
+    const header = excelCellText(headerRow.getCell(col));
+    if (header) {
+      headerIndex.set(normalizeHeaderKey(header), { header, col, column: columnLetter(col), cell: `${columnLetter(col)}3` });
+    }
+  }
+
+  const mapping = [];
+  for (const fieldName of AUTOMATIC_FIELD_ORDER) {
+    const config = AUTOMATIC_FIELD_CONFIG[fieldName];
+    const match = (config.headers || []).map(normalizeHeaderKey).map((header) => headerIndex.get(header)).find(Boolean) || null;
+    const targetCell = match ? worksheet.getCell(3, match.col) : null;
+    const hasFormula = targetCell ? cellHasFormula(targetCell) : false;
+    mapping.push({
+      campo: fieldName,
+      encabezado_excel: match?.header || null,
+      columna: match?.column || null,
+      celda_destino: match?.cell || null,
+      tipo: hasFormula ? "formula" : match ? "automatico" : "manual",
+      regla: hasFormula ? "FORMULA" : match ? "automatico" : "sin_columna_en_template",
+      aliases: config.aliases,
+      validation: config.validation,
+      sharedCellGroup: config.sharedCellGroup || null,
+      formula: hasFormula ? targetCell.value.formula : null,
+      valor_template: targetCell ? excelCellText(targetCell) : null,
+    });
+  }
+
+  for (const config of NON_AUTOMATIC_COLUMNS) {
+    const match = (config.headers || []).map(normalizeHeaderKey).map((header) => headerIndex.get(header)).find(Boolean) || null;
+    if (!match) continue;
+    const targetCell = worksheet.getCell(3, match.col);
+    const hasFormula = cellHasFormula(targetCell);
+    mapping.push({
+      campo: config.field,
+      encabezado_excel: match.header,
+      columna: match.column,
+      celda_destino: match.cell,
+      tipo: hasFormula ? "formula" : config.tipo,
+      regla: config.rule || (hasFormula ? "FORMULA" : config.tipo),
+      formula: hasFormula ? targetCell.value.formula : null,
+      valor_template: excelCellText(targetCell),
+      valor_fijo: FIXED_FIELD_VALUES[config.field] || null,
+    });
+  }
+
+  return {
+    template: templatePath,
+    worksheet: worksheet.name,
+    targetRow: 3,
+    fields: mapping,
+  };
+}
+
+async function buildAllowedFieldsMappingFromOds(templatePath) {
   const { contentXml } = await loadOdsContent(templatePath);
   const worksheetNameMatch = contentXml.match(/<table:table\b[^>]*table:name="([^"]+)"/);
   if (!worksheetNameMatch) throw new Error("ODS invalido: no contiene hojas.");
@@ -1719,8 +2023,16 @@ async function buildAllowedFieldsMapping(templatePath) {
   return {
     template: templatePath,
     worksheet: worksheetName,
+    targetRow: 3,
     fields: mapping,
   };
+}
+
+async function buildAllowedFieldsMapping(templatePath) {
+  if (path.extname(templatePath).toLowerCase() === ".xlsx") {
+    return buildAllowedFieldsMappingFromXlsx(templatePath);
+  }
+  return buildAllowedFieldsMappingFromOds(templatePath);
 }
 
 async function writeAllowedFieldsMappingDebug(templatePath) {
@@ -1729,15 +2041,20 @@ async function writeAllowedFieldsMappingDebug(templatePath) {
   return mapping;
 }
 
-async function readBackXlsxCells(xlsxPath, cellAddresses = []) {
+async function readBackXlsxCells(xlsxPath, cellAddresses = [], worksheetName = "notificar") {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(xlsxPath);
-  const worksheet = workbook.worksheets[0];
+  const worksheet = workbook.getWorksheet(worksheetName) || workbook.worksheets[0];
   if (!worksheet) throw new Error("XLSX invalido: no contiene hojas.");
   const cells = {};
   for (const cellAddress of cellAddresses) {
-    const value = worksheet.getCell(cellAddress).value;
-    cells[cellAddress] = value && typeof value === "object" && value.text ? value.text : value;
+    const cell = worksheet.getCell(cellAddress);
+    const value = cell.value;
+    cells[cellAddress] = {
+      value: value && typeof value === "object" && value.text ? value.text : value,
+      text: excelCellText(cell),
+      formula: cellHasFormula(cell) ? value.formula : null,
+    };
   }
   return {
     file: xlsxPath,
@@ -1806,11 +2123,77 @@ async function writeOdsWorkbook(templatePath, outPath, debugRunDir, log, fullExt
   const mapping = {};
   const writeGroups = new Map();
   for (const mapItem of allowedFieldsMapping.fields || []) {
-    if (mapItem.tipo !== "automatico" || !mapItem.celda_destino) continue;
+    if (!mapItem.celda_destino) {
+      mapping[mapItem.campo] = {
+        field: mapItem.campo,
+        cell: null,
+        header: mapItem.encabezado_excel || null,
+        source: "vacio",
+        state: "vacio",
+        written: false,
+        status: "sin_celda_destino",
+      };
+      continue;
+    }
+    const previousCellXml = odsCellAt(generatedRowXml, mapItem.columna.split("").reduce((value, letter) => value * 26 + letter.charCodeAt(0) - 64, 0));
+    const base = {
+      field: mapItem.campo,
+      cell: mapItem.celda_destino,
+      header: mapItem.encabezado_excel || null,
+      worksheet: allowedFieldsMapping.worksheet,
+      type: /\btable:formula=/.test(previousCellXml) ? "formula" : mapItem.tipo,
+      previous: odsCellText(previousCellXml),
+      written: false,
+    };
+
+    if (/\btable:formula=/.test(previousCellXml) || mapItem.tipo === "formula") {
+      mapping[mapItem.campo] = { ...base, source: "formula", state: "formula", status: "omitido_formula_existente", valueAttempted: null };
+      log.push({ phase: "write_ods_allowed", cell: mapItem.celda_destino, fields: [mapItem.campo], status: "omitido_formula_existente" });
+      continue;
+    }
+
+    if (mapItem.tipo === "fijo_template") {
+      const fixedValue = FIXED_FIELD_VALUES[mapItem.campo];
+      mapping[mapItem.campo] = { ...base, source: "fijo", state: fixedValue ? "validado" : "vacio", status: fixedValue ? "pendiente" : "omitido_valor_fijo_no_configurado", valueAttempted: fixedValue || null };
+      if (fixedValue) {
+        if (!writeGroups.has(mapItem.celda_destino)) {
+          writeGroups.set(mapItem.celda_destino, { fields: [], values: [], validation: "text", column: mapItem.columna, source: "fijo" });
+        }
+        const group = writeGroups.get(mapItem.celda_destino);
+        group.fields.push(mapItem.campo);
+        group.values.push(fixedValue);
+      }
+      continue;
+    }
+
+    if (mapItem.tipo !== "automatico") {
+      mapping[mapItem.campo] = { ...base, source: "vacio", state: "manual", status: "omitido_manual", valueAttempted: null };
+      continue;
+    }
     const extraction = fullExtraction.fields?.[mapItem.campo];
-    if (!extraction || !["validado", "revisar"].includes(extraction.estado)) continue;
+    if (!extraction || !["validado", "revisar"].includes(extraction.estado)) {
+      mapping[mapItem.campo] = {
+        ...base,
+        source: extraction?.fuente || "vacio",
+        state: extraction?.estado || "vacio",
+        status: "omitido_valor_vacio",
+        valueAttempted: extraction?.valor_normalizado ?? null,
+        detectedValue: extraction?.valor_vision_original ?? null,
+      };
+      continue;
+    }
+    mapping[mapItem.campo] = {
+      ...base,
+      source: extraction.fuente || "vision",
+      state: extraction.estado,
+      status: "pendiente",
+      valueAttempted: extraction.valor_normalizado,
+      detectedValue: extraction.valor_vision_original,
+      confidence: extraction.confianza,
+      notes: extraction.motivo || null,
+    };
     if (!writeGroups.has(mapItem.celda_destino)) {
-      writeGroups.set(mapItem.celda_destino, { fields: [], values: [], validation: mapItem.validation, column: mapItem.columna });
+      writeGroups.set(mapItem.celda_destino, { fields: [], values: [], validation: mapItem.validation, column: mapItem.columna, source: extraction.fuente || "vision" });
     }
     const group = writeGroups.get(mapItem.celda_destino);
     group.fields.push(mapItem.campo);
@@ -1839,6 +2222,18 @@ async function writeOdsWorkbook(templatePath, outPath, debugRunDir, log, fullExt
     mapping[cellAddress].status = "escrito";
     mapping[cellAddress].previous = previous;
     mapping[cellAddress].valueWritten = value;
+    mapping[cellAddress].written = true;
+    mapping[cellAddress].source = group.source;
+    mapping[cellAddress].state = "validado";
+    for (const fieldName of group.fields) {
+      mapping[fieldName] = {
+        ...(mapping[fieldName] || {}),
+        cell: cellAddress,
+        status: "escrito",
+        valueWritten: value,
+        written: true,
+      };
+    }
     log.push({ phase: "write_ods_allowed", cell: cellAddress, fields: group.fields, status: "escrito", value, previous });
   }
 
@@ -1874,7 +2269,7 @@ async function writeOdsWorkbook(templatePath, outPath, debugRunDir, log, fullExt
 async function writeXlsxWorkbook(templatePath, outPath, log, fullExtraction, allowedFieldsMapping) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(templatePath);
-  const worksheet = workbook.worksheets[0];
+  const worksheet = workbook.getWorksheet(allowedFieldsMapping.worksheet || "notificar") || workbook.worksheets[0];
   if (!worksheet) throw new Error("XLSX invalido: no contiene hojas.");
 
   const mapping = {};
@@ -1882,11 +2277,79 @@ async function writeXlsxWorkbook(templatePath, outPath, log, fullExtraction, all
 
   const writeGroups = new Map();
   for (const mapItem of allowedFieldsMapping.fields || []) {
-    if (mapItem.tipo !== "automatico" || !mapItem.celda_destino) continue;
+    if (!mapItem.celda_destino) {
+      mapping[mapItem.campo] = {
+        field: mapItem.campo,
+        cell: null,
+        header: mapItem.encabezado_excel || null,
+        source: "vacio",
+        state: "vacio",
+        written: false,
+        status: "sin_celda_destino",
+      };
+      continue;
+    }
+    const cell = worksheet.getCell(mapItem.celda_destino);
+    const hasFormula = cellHasFormula(cell);
+    const base = {
+      field: mapItem.campo,
+      cell: mapItem.celda_destino,
+      header: mapItem.encabezado_excel || null,
+      worksheet: worksheet.name,
+      type: hasFormula ? "formula" : mapItem.tipo,
+      formula: hasFormula ? cell.value.formula : null,
+      previous: excelCellText(cell),
+      written: false,
+    };
+
+    if (hasFormula || mapItem.tipo === "formula") {
+      mapping[mapItem.campo] = { ...base, source: "formula", state: "formula", status: "omitido_formula_existente", valueAttempted: null };
+      log.push({ phase: "write_xlsx_allowed", cell: mapItem.celda_destino, fields: [mapItem.campo], status: "omitido_formula_existente" });
+      continue;
+    }
+
+    if (mapItem.tipo === "fijo_template") {
+      const fixedValue = FIXED_FIELD_VALUES[mapItem.campo];
+      mapping[mapItem.campo] = { ...base, source: "fijo", state: fixedValue ? "validado" : "vacio", status: fixedValue ? "pendiente" : "omitido_valor_fijo_no_configurado", valueAttempted: fixedValue || null };
+      if (fixedValue) {
+        if (!writeGroups.has(mapItem.celda_destino)) {
+          writeGroups.set(mapItem.celda_destino, { fields: [], values: [], validation: "text", source: "fijo" });
+        }
+        const group = writeGroups.get(mapItem.celda_destino);
+        group.fields.push(mapItem.campo);
+        group.values.push(fixedValue);
+      }
+      continue;
+    }
+
+    if (mapItem.tipo !== "automatico") {
+      mapping[mapItem.campo] = { ...base, source: "vacio", state: "manual", status: "omitido_manual", valueAttempted: null };
+      continue;
+    }
     const extraction = fullExtraction.fields?.[mapItem.campo];
-    if (!extraction || !["validado", "revisar"].includes(extraction.estado)) continue;
+    if (!extraction || !["validado", "revisar"].includes(extraction.estado)) {
+      mapping[mapItem.campo] = {
+        ...base,
+        source: extraction?.fuente || "vacio",
+        state: extraction?.estado || "vacio",
+        status: "omitido_valor_vacio",
+        valueAttempted: extraction?.valor_normalizado ?? null,
+        detectedValue: extraction?.valor_vision_original ?? null,
+      };
+      continue;
+    }
+    mapping[mapItem.campo] = {
+      ...base,
+      source: extraction.fuente || "vision",
+      state: extraction.estado,
+      status: "pendiente",
+      valueAttempted: extraction.valor_normalizado,
+      detectedValue: extraction.valor_vision_original,
+      confidence: extraction.confianza,
+      notes: extraction.motivo || null,
+    };
     if (!writeGroups.has(mapItem.celda_destino)) {
-      writeGroups.set(mapItem.celda_destino, { fields: [], values: [], validation: mapItem.validation });
+      writeGroups.set(mapItem.celda_destino, { fields: [], values: [], validation: mapItem.validation, source: extraction.fuente || "vision" });
     }
     const group = writeGroups.get(mapItem.celda_destino);
     group.fields.push(mapItem.campo);
@@ -1901,11 +2364,15 @@ async function writeXlsxWorkbook(templatePath, outPath, log, fullExtraction, all
     let value = uniqueValues.join(" ");
     if (group.validation === "amount") value = Number(String(uniqueValues[0] || "").replace(/[^\d.-]/g, ""));
     mapping[cellAddress] = {
+      ...(mapping[group.fields[0]] || {}),
       cell: cellAddress,
       fields: group.fields,
       valueAttempted: value,
       worksheet: worksheet.name,
       status: "pendiente",
+      source: group.source,
+      state: "validado",
+      written: false,
     };
 
     if (cellHasFormula(cell)) {
@@ -1925,11 +2392,57 @@ async function writeXlsxWorkbook(templatePath, outPath, log, fullExtraction, all
     mapping[cellAddress].status = "escrito";
     mapping[cellAddress].previous = previous;
     mapping[cellAddress].valueWritten = value;
+    mapping[cellAddress].written = true;
+    for (const fieldName of group.fields) {
+      mapping[fieldName] = {
+        ...(mapping[fieldName] || {}),
+        cell: cellAddress,
+        status: "escrito",
+        valueWritten: value,
+        written: true,
+      };
+    }
     log.push({ phase: "write_xlsx_allowed", cell: cellAddress, fields: group.fields, status: "escrito", value, previous });
   }
 
   await workbook.xlsx.writeFile(outPath);
   return { path: outPath, fixedMapping: mapping };
+}
+
+function buildValidationReport(fullExtraction, fullMapping, readback) {
+  const report = {};
+  const readbackCells = readback?.cells || {};
+  for (const mapItem of fullMapping.allowedFieldsMapping || []) {
+    const extraction = fullExtraction.fields?.[mapItem.campo] || null;
+    const writeResult = fullMapping.writeResult?.[mapItem.campo] || fullMapping.writeResult?.[mapItem.celda_destino] || null;
+    const cellReadback = mapItem.celda_destino ? readbackCells[mapItem.celda_destino] : null;
+    report[mapItem.campo] = {
+      valor_detectado: extraction?.valor_vision_original ?? null,
+      valor_normalizado: extraction?.valor_normalizado ?? writeResult?.valueAttempted ?? null,
+      fuente: writeResult?.source || extraction?.fuente || (mapItem.tipo === "formula" ? "formula" : mapItem.tipo === "fijo_template" ? "fijo" : "vacio"),
+      estado: writeResult?.state || extraction?.estado || (mapItem.tipo === "manual" ? "manual" : "vacio"),
+      celda_destino: mapItem.celda_destino || null,
+      encabezado_excel: mapItem.encabezado_excel || null,
+      escrito: Boolean(writeResult?.written),
+      estado_escritura: writeResult?.status || (mapItem.tipo === "manual" ? "omitido_manual" : mapItem.tipo === "formula" ? "omitido_formula_existente" : "sin_resultado_escritura"),
+      valor_escrito: writeResult?.valueWritten ?? null,
+      valor_leido_excel: cellReadback?.text ?? cellReadback?.value ?? null,
+      formula: writeResult?.formula || cellReadback?.formula || mapItem.formula || null,
+    };
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    template: fullMapping.template,
+    worksheet: fullMapping.worksheet,
+    fields: report,
+    summary: {
+      detected: Object.values(report).filter((item) => item.valor_detectado != null && item.valor_detectado !== "").length,
+      written: Object.values(report).filter((item) => item.escrito).length,
+      empty: Object.values(report).filter((item) => item.estado === "vacio" || item.estado === "vacío").length,
+      manualSkipped: Object.values(report).filter((item) => item.estado_escritura === "omitido_manual").length,
+      formulaSkipped: Object.values(report).filter((item) => item.estado_escritura === "omitido_formula_existente").length,
+    },
+  };
 }
 
 function summarizeFields(detectedFields) {
@@ -2076,7 +2589,7 @@ async function processFile(filePath, allowedFieldsMapping) {
   const fullExtraction = buildFullExtraction(detectedFields, diagnostic, allowedFieldsMapping);
   const validationReport = fullExtraction;
   const diagnosis = stats.useful
-    ? "Vision recupero datos. Si el XLSX queda vacio, revisar allowed_fields_mapping/readback."
+    ? "Vision recupero datos. Si el ODS queda vacio, revisar allowed_fields_mapping/readback."
     : "OCR no recupero texto suficiente del manuscrito. El problema esta en preprocessing/OCR antes del mapeo.";
 
   log.push({ phase: "fields_found", status: "ok", value: summary.found });
@@ -2120,27 +2633,42 @@ async function processFile(filePath, allowedFieldsMapping) {
 async function main() {
   ensureDirs();
   ensureOpenAiEnvFiles();
-  if (!hasConfiguredOpenAiApiKey()) {
+  const inputArg = argValue("--input");
+  const explicitInputPath = resolveInputPath(inputArg);
+  const inputExists = explicitInputPath ? fs.existsSync(explicitInputPath) : false;
+  const openAiEnabled = !USE_VISION_CACHE && hasConfiguredOpenAiApiKey();
+
+  console.log(`Input recibido: ${inputArg || "(no informado)"}`);
+  console.log(`Ruta absoluta resuelta: ${explicitInputPath || "(sin ruta)"}`);
+  console.log(`Archivo existe: ${inputExists ? "SI" : "NO"}`);
+  console.log(`Modo: ${USE_VISION_CACHE ? "CACHE ONLY" : "VISION"}`);
+  console.log(`OpenAI: ${openAiEnabled ? "ENABLED" : "DISABLED"}`);
+
+  if (!inputArg) {
+    throw new Error(INPUT_REQUIRED_MESSAGE);
+  }
+  if (!inputExists) {
+    throw new Error(`No existe el archivo indicado por --input: ${explicitInputPath}. Abortado sin llamar a OpenAI.`);
+  }
+  if (!SUPPORTED_EXTENSIONS.has(path.extname(explicitInputPath).toLowerCase())) {
+    throw new Error(`Extension no soportada para --input: ${path.extname(explicitInputPath)}. Abortado sin llamar a OpenAI.`);
+  }
+  if (USE_VISION_CACHE) {
+    console.log("Cache Vision requerido: no se hara fallback a OpenAI.");
+  }
+  if (!hasConfiguredOpenAiApiKey() && !USE_VISION_CACHE) {
     console.error(VISION_API_KEY_MESSAGE);
     return;
   }
-  console.log("OPENAI_API_KEY detectada");
+  console.log(USE_VISION_CACHE ? "OpenAI deshabilitado: cache Vision activo" : "OPENAI_API_KEY detectada");
   moveExistingAuxiliaryOutputFiles();
   const allLogs = [];
   const templatePath = findTemplate();
-  console.log(`Template oficial utilizado: ${path.relative(PROJECT_ROOT, templatePath)}`);
+  console.log(`Template ODS utilizado: ${path.relative(PROJECT_ROOT, templatePath)}`);
   allLogs.push({ file: null, phase: "template", status: "oficial_utilizado", value: path.relative(PROJECT_ROOT, templatePath), absolutePath: templatePath });
   const allowedFieldsMapping = await writeAllowedFieldsMappingDebug(templatePath);
   allLogs.push({ file: null, phase: "template", status: "allowed_fields_mapping_escrito", value: ALLOWED_FIELDS_MAPPING_DEBUG_PATH, worksheet: allowedFieldsMapping.worksheet });
-  const files = fs
-    .readdirSync(INPUT_DIR)
-    .filter((name) => SUPPORTED_EXTENSIONS.has(path.extname(name).toLowerCase()))
-    .sort()
-    .map((name) => path.join(INPUT_DIR, name));
-
-  if (files.length === 0) {
-    throw new Error(`No hay imagenes o PDFs soportados en ${INPUT_DIR}`);
-  }
+  const files = [explicitInputPath];
 
   let processed = 0;
   let failed = 0;
@@ -2154,7 +2682,6 @@ async function main() {
       fs.mkdirSync(debugRunDir, { recursive: true });
       const jsonPath = path.join(debugRunDir, `${baseName}_manuscrito_${stamp}.json`);
       const odsPath = path.join(OUTPUT_DIR, `${baseName}_manuscrito_${stamp}.ods`);
-      const xlsxPath = path.join(OUTPUT_DIR, `${baseName}_manuscrito_${stamp}.xlsx`);
       const rawOcrPath = path.join(debugRunDir, `${baseName}_manuscrito_raw_ocr.txt`);
       const originalDebugPath = path.join(debugRunDir, `${baseName}_manuscrito_${stamp}_original${path.extname(fileName).toLowerCase()}`);
       const preprocessedDebugPath = path.join(debugRunDir, `${baseName}_manuscrito_${stamp}_preprocessed.png`);
@@ -2169,7 +2696,8 @@ async function main() {
       const candidateCount = Object.values(result.candidates || {}).reduce((total, value) => total + (Array.isArray(value) ? value.length : 0), 0);
       const ocrFailed = result.ocrStats.chars < OCR_HARD_FAIL_CHARS;
       const hasUsefulDetectedData = result.fullExtraction?.summary?.detected > 0 || candidateCount > 0;
-      const shouldWriteOds = !ocrFailed && hasUsefulDetectedData && writeableFields.length > 0;
+      const fixedFields = (allowedFieldsMapping.fields || []).filter((item) => item.tipo === "fijo_template" && FIXED_FIELD_VALUES[item.campo]);
+      const shouldWriteOds = !ocrFailed && hasUsefulDetectedData && (writeableFields.length > 0 || fixedFields.length > 0);
       const configurationError = result.ocrDiagnostic?.configurationError || null;
       result.fullMapping = {
         template: templatePath,
@@ -2208,7 +2736,7 @@ async function main() {
       };
       result.outputFiles = {
         json: jsonPath,
-        xlsx: EXPERIMENTAL_XLSX_ENABLED && shouldWriteOds ? xlsxPath : null,
+        xlsx: null,
         ods: shouldWriteOds ? odsPath : null,
         rawOcr: rawOcrPath,
         originalImage: originalDebugPath,
@@ -2216,10 +2744,12 @@ async function main() {
         ocrBlocks: blocksPath,
         diagnostic: diagnosticPath,
         allowedFieldsMapping: ALLOWED_FIELDS_MAPPING_DEBUG_PATH,
+        fullVisionResponse: VISION_CACHE_PATH,
         fullExtraction: path.join(debugRunDir, "full_extraction.json"),
         fullMapping: path.join(debugRunDir, "full_mapping.json"),
-        readbackOds: READBACK_ODS_DEBUG_PATH,
-        readbackXlsx: EXPERIMENTAL_XLSX_ENABLED ? READBACK_XLSX_DEBUG_PATH : null,
+        validationReport: path.join(debugRunDir, "validation_report.json"),
+        readbackOds: null,
+        readbackXlsx: null,
         debugArtifacts: null,
         debugDir: debugRunDir,
       };
@@ -2266,30 +2796,23 @@ async function main() {
 
       const odsLog = [];
       const odsResult = await writeOdsWorkbook(templatePath, odsPath, debugRunDir, odsLog, result.fullExtraction, allowedFieldsMapping);
-      const writtenCells = Object.values(odsResult.fixedMapping || {}).filter((item) => item.status === "escrito").map((item) => item.cell);
-      const odsReadback = await readBackOdsCells(odsPath, allowedFieldsMapping.worksheet, writtenCells);
+      const readbackCells = [...new Set((allowedFieldsMapping.fields || []).map((item) => item.celda_destino).filter(Boolean))];
+      const odsReadback = await readBackOdsCells(odsPath, allowedFieldsMapping.worksheet, readbackCells);
       fs.writeFileSync(READBACK_ODS_DEBUG_PATH, JSON.stringify(odsReadback, null, 2), "utf8");
       fs.writeFileSync(path.join(debugRunDir, "readback_ods.json"), JSON.stringify(odsReadback, null, 2), "utf8");
       result.odsReadback = odsReadback;
-      result.odsXmlValidation = odsResult.validationReport;
       result.outputMapping = odsResult.fixedMapping || result.outputMapping;
       result.fullMapping = { ...result.fullMapping, writeResult: result.outputMapping };
+      result.validationReport = buildValidationReport(result.fullExtraction, result.fullMapping, odsReadback);
+      result.odsFormulaValidation = odsResult.validationReport;
       result.outputFiles.debugArtifacts = await writeDebugArtifacts(debugRunDir, result, result.log);
+      fs.writeFileSync(path.join(debugRunDir, "validation_report.json"), JSON.stringify(result.validationReport, null, 2), "utf8");
+      fs.writeFileSync(VALIDATION_REPORT_DEBUG_PATH, JSON.stringify(result.validationReport, null, 2), "utf8");
+      fs.writeFileSync(path.join(debugRunDir, "full_mapping.json"), JSON.stringify(result.fullMapping, null, 2), "utf8");
+      fs.writeFileSync(FULL_MAPPING_DEBUG_PATH, JSON.stringify(result.fullMapping, null, 2), "utf8");
       result.log.push({ phase: "output", status: "ods_escrito", value: odsPath });
       result.log.push({ phase: "output", status: "ods_readback_escrito", value: READBACK_ODS_DEBUG_PATH, worksheet: odsReadback.worksheet });
       result.log.push(...odsLog);
-      if (EXPERIMENTAL_XLSX_ENABLED) {
-        if (!fs.existsSync(TEMPLATE_XLSX_PATH)) throw new Error(`No existe el template XLSX experimental: ${TEMPLATE_XLSX_PATH}`);
-        const xlsxLog = [];
-        const xlsxResult = await writeXlsxWorkbook(TEMPLATE_XLSX_PATH, xlsxPath, xlsxLog, result.fullExtraction, allowedFieldsMapping);
-        const xlsxWrittenCells = Object.values(xlsxResult.fixedMapping || {}).filter((item) => item.status === "escrito").map((item) => item.cell);
-        const xlsxReadback = await readBackXlsxCells(xlsxPath, xlsxWrittenCells);
-        fs.writeFileSync(READBACK_XLSX_DEBUG_PATH, JSON.stringify(xlsxReadback, null, 2), "utf8");
-        fs.writeFileSync(path.join(debugRunDir, "readback_xlsx.json"), JSON.stringify(xlsxReadback, null, 2), "utf8");
-        result.xlsxReadback = xlsxReadback;
-        result.log.push({ phase: "output", status: "xlsx_experimental_escrito", value: xlsxPath });
-        result.log.push(...xlsxLog);
-      }
       fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2), "utf8");
       if (result.ocrDiagnostic?.workDir) {
         fs.rmSync(result.ocrDiagnostic.workDir, { recursive: true, force: true });
@@ -2298,7 +2821,6 @@ async function main() {
       allLogs.push({ file: fileName, phase: "output", status: "json_escrito", value: jsonPath });
       processed += 1;
       console.log(`${fileName}: ODS generado ${odsPath}`);
-      if (EXPERIMENTAL_XLSX_ENABLED) console.log(`${fileName}: XLSX experimental generado ${xlsxPath}`);
       console.log(`${fileName}: Debug generado ${debugRunDir}`);
     } catch (error) {
       allLogs.push({ file: fileName, phase: "processing", status: "error", value: error.message });
